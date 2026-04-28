@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python -c \"import os; [print\\(f, 'has_null:', b'\\\\x00' in open\\(os.path.join\\('c:/nanobot/pinterest-pod-agent/app/workflows', f\\), 'rb'\\).read\\(\\)\\)\\) for f in os.listdir\\('c:/nanobot/pinterest-pod-agent/app/workflows'\\) if f.endswith\\('.py'\\)]\")",
+      "Bash(python -c \"import app.workflows.warmup_flow\")",
+      "Bash(python -c \"from app.automation.human_sim import HumanSimulator; from app.automation.anti_detect import FingerprintMutator; from app.automation.browser_factory import BrowserPool; print\\('All imports OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -v)"
+    ]
+  }
+}
