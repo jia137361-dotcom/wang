@@ -18,7 +18,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.account_policy import AccountPolicy
-from app.models.publish_job import PublishJob
 from app.models.scheduled_task import ScheduledTask
 
 logger = logging.getLogger(__name__)
@@ -64,7 +63,7 @@ def dispatch_ready_tasks(
     now = datetime.now(UTC)
     batch_id = uuid4().hex[:16]
     dispatched = 0
-    skipped: dict[str, int] = {"cooldown": 0, "out_of_window": 0, "locked": 0}
+    skipped: dict[str, int] = {"cooldown": 0, "out_of_window": 0, "locked": 0, "account_busy": 0}
 
     rows = list(
         db.scalars(
@@ -84,17 +83,6 @@ def dispatch_ready_tasks(
         ).all()
     )
 
-    # --- legacy: also scan publish_job for backwards compatibility ---
-    legacy_jobs = list(
-        db.scalars(
-            select(PublishJob)
-            .where(PublishJob.status.in_(["pending", "ready"]))
-            .order_by(PublishJob.created_at.asc())
-            .limit(max(0, limit - len(rows)))
-        ).all()
-    )
-    # ----------------------------------------------------------------
-
     # Phase 1 — atomic claim under FOR UPDATE SKIP LOCKED
     claimed: list[tuple[ScheduledTask, dict[str, object], str, str]] = []
 
@@ -106,6 +94,16 @@ def dispatch_ready_tasks(
                 continue
             if not _within_time_window(policy, now):
                 skipped["out_of_window"] += 1
+                continue
+
+            existing_running = db.scalar(
+                select(func.count(ScheduledTask.id)).where(
+                    ScheduledTask.account_id == task.account_id,
+                    ScheduledTask.status == "running",
+                )
+            )
+            if existing_running:
+                skipped["account_busy"] += 1
                 continue
 
         task.status = "ready"
@@ -168,38 +166,11 @@ def dispatch_ready_tasks(
         )
     db.commit()
 
-    # --- legacy dispatch ---
-    # Skip jobs already covered by a dispatched scheduled_task
-    covered_job_ids = {
-        task.payload_json.get("job_id")
-        for task, _p, _n, _q in claimed
-        if task.payload_json.get("job_id")
-    }
-    for job in legacy_jobs:
-        if job.job_id in covered_job_ids:
-            continue
-        if job.status == "pending":
-            job.status = "ready"
-    db.commit()
-    for job in legacy_jobs:
-        if job.job_id in covered_job_ids:
-            continue
-        from app.jobs.tasks import publish_job_task
-
-        async_result = publish_job_task.apply_async(
-            args=[job.job_id],
-            kwargs={"dry_run": dry_run, "content_batch_id": batch_id},
-            queue="publish",
-        )
-        dispatched += 1
-    # -------------------------------------------------
-
     return {
         "dispatched": dispatched,
         "skipped": skipped,
         "batch_id": batch_id,
         "dry_run": dry_run,
-        "legacy_jobs": len(legacy_jobs),
     }
 
 

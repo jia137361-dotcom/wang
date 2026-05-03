@@ -11,6 +11,8 @@ import httpx
 from app.config import get_settings
 from app.tools.image_gen_client import generate_high_res_image
 
+DEFAULT_PIN_IMAGE_SIZE = '{"width": 800, "height": 1200}'
+
 
 @dataclass(frozen=True)
 class GeneratedImageAsset:

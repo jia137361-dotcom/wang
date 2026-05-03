@@ -26,8 +26,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETRY_BACKOFF = 60        # seconds, multiplied by 2^attempt
 
 
-def _update_heartbeat(scheduled_task_id: str | None) -> None:
-    """Update heartbeat_at on the scheduled_task to prevent stale-task timeout."""
+def _update_heartbeat(
+    scheduled_task_id: str | None,
+    account_id: str | None = None,
+    profile_id: str | None = None,
+) -> None:
+    """Update heartbeat_at on the scheduled_task and renew Redis lock TTLs."""
     if not scheduled_task_id:
         return
     from app.models.scheduled_task import ScheduledTask
@@ -39,6 +43,17 @@ def _update_heartbeat(scheduled_task_id: str | None) -> None:
         if st and st.status == "running":
             st.heartbeat_at = datetime.now(UTC)
             db.commit()
+
+    if account_id:
+        from app.safety.locks import renew_locks_once_sync
+
+        try:
+            renew_locks_once_sync(account_id, profile_id)
+        except Exception:
+            logger.debug(
+                "Failed to renew Redis locks account=%s — non-fatal", account_id,
+                exc_info=True,
+            )
 
 
 def _st_writeback(
@@ -83,24 +98,211 @@ def _check_final_retry_and_writeback(
     error_message: str | None = None,
     error_type: str | None = None,
 ) -> None:
-    """Write 'failed' only when Celery has exhausted all retry attempts.
+    """Write 'failed' when Celery has exhausted all retry attempts.
 
-    For tasks using ``autoretry_for``, we must not write 'failed' on
-    intermediate attempts — only on the final one.  Otherwise the DB
-    prematurely shows 'failed' while Celery is still retrying.
+    On intermediate attempts, update next_retry_at + error_message so
+    reclaim knows the task is still being retried by Celery rather than
+    stranded in 'running'.
     """
     if not scheduled_task_id:
         return
     from celery import current_task
 
+    from app.models.scheduled_task import ScheduledTask
+
     task_req = current_task.request if current_task else None
-    if task_req is not None and task_req.retries >= getattr(task_req, "max_retries", 3):
-        _st_writeback(
-            scheduled_task_id,
-            "failed",
-            error_message=error_message,
-            error_type=error_type,
+    now = datetime.now(UTC)
+
+    with get_sessionmaker()() as db:
+        st = db.scalar(
+            select(ScheduledTask).where(ScheduledTask.task_id == scheduled_task_id)
         )
+        if st is None:
+            return
+
+        if task_req is not None:
+            retries = task_req.retries
+            max_retries = getattr(task_req, "max_retries", 3)
+            if retries >= max_retries:
+                st.status = "failed"
+                st.finished_at = now
+                st.locked_by = None
+                st.lock_until = None
+                st.celery_task_id = None
+            else:
+                # Intermediate retry — keep status=running but signal Celery
+                # is still retrying via next_retry_at so reclaim won't kill it.
+                retry_delay = getattr(task_req, "default_retry_delay", 60)
+                backoff = min(2 ** retries * retry_delay, 600)
+                st.next_retry_at = now + timedelta(seconds=backoff)
+        else:
+            st.status = "failed"
+            st.finished_at = now
+            st.locked_by = None
+            st.lock_until = None
+            st.celery_task_id = None
+
+        if error_message is not None:
+            st.error_message = error_message
+        if error_type is not None:
+            st.error_type = error_type
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# helpers: regenerate content + image fresh each publish
+# ---------------------------------------------------------------------------
+
+
+async def _regenerate_content(
+    job: PublishJob,
+    account_id: str,
+    db: Any,
+) -> None:
+    """Regenerate title + description via EvoMap, with dedup against history.
+
+    Overwrites job.title, job.description, job.*_hash in-place and commits.
+    Raises RetryableTaskError on LLM failure so Celery retries.
+    """
+    from app.evomap.content_dedup import ContentDeduper
+    from app.evomap.prompt_evolve import PromptEvolver
+    from app.models.pin_performance import PinPerformance
+
+    context = PromptContext(
+        product_type=job.product_type,
+        niche=job.niche,
+        audience=job.audience,
+        season=job.season,
+        offer=job.offer,
+        destination_url=job.destination_url,
+    )
+
+    evolver = PromptEvolver(db=db)
+
+    dedup = ContentDeduper()
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+
+    # try up to 2 rounds (initial + 1 retry with different angle hint)
+    for attempt in range(2):
+        try:
+            content = await evolver.agenerate_single_content(context)
+        except Exception as exc:
+            if attempt == 1:
+                raise RetryableTaskError(
+                    f"LLM content generation failed after retry: {exc}"
+                ) from exc
+            continue
+
+        title = content.get("title", "")
+        description = content.get("description", "")
+        if not title or not description:
+            if attempt == 1:
+                raise RetryableTaskError(
+                    "LLM returned empty title or description after retry"
+                )
+            continue
+
+        # dedup against 30-day PinPerformance history
+        history_rows = list(
+            db.scalars(
+                select(PinPerformance)
+                .where(
+                    PinPerformance.account_id == account_id,
+                    PinPerformance.niche == context.niche,
+                    PinPerformance.product_type == context.product_type,
+                    PinPerformance.published_at >= cutoff,
+                )
+                .order_by(PinPerformance.published_at.desc())
+                .limit(60)
+            ).all()
+        )
+        history = [
+            {"title": r.title, "description": r.description} for r in history_rows
+        ]
+
+        hist_rejected, hist_reason = dedup.check_against_history(
+            title=title, description=description, history=history
+        )
+        if hist_rejected:
+            logger.info(
+                "Content dedup failed job=%s attempt=%d reason=%s — retrying",
+                job.job_id, attempt, hist_reason,
+            )
+            continue
+
+        # accepted — write back
+        job.title = title
+        job.description = description
+        job.title_hash = dedup.stable_hash(title)
+        job.description_hash = dedup.stable_hash(description)
+        job.content_hash = dedup.stable_hash(f"{title}|{description}")
+        db.commit()
+        logger.info(
+            "Content regenerated job=%s title=%.60s... hash=%s",
+            job.job_id, title, job.content_hash,
+        )
+        return
+
+    raise RetryableTaskError(
+        f"Content dedup failed after all retries for job {job.job_id}"
+    )
+
+
+async def _generate_fresh_image(
+    job: PublishJob,
+    db: Any,
+) -> None:
+    """Generate a fresh image via EvoMap visual prompt → Flux 2 Pro → ESRGAN.
+
+    Overwrites job.image_path in-place and commits.
+    Raises RetryableTaskError on failure so Celery retries.
+    """
+    from app.evomap.prompt_evolve import PromptEvolver
+    from app.workflows.image_generation_flow import DEFAULT_PIN_IMAGE_SIZE, generate_image_asset
+
+    context = PromptContext(
+        product_type=job.product_type,
+        niche=job.niche,
+        audience=job.audience,
+        season=job.season,
+        offer=job.offer,
+        destination_url=job.destination_url,
+    )
+
+    evolver = PromptEvolver(db=db)
+    visual_prompt = await evolver.agenerate_visual_brief(context)
+
+    if not visual_prompt or len(visual_prompt.strip()) < 10:
+        raise RetryableTaskError(
+            f"LLM returned empty/too-short visual prompt for job {job.job_id}"
+        )
+
+    logger.info(
+        "Auto-generating image for job=%s prompt=%.80s...",
+        job.job_id,
+        visual_prompt,
+    )
+
+    try:
+        asset = await generate_image_asset(
+            prompt=visual_prompt,
+            image_size=DEFAULT_PIN_IMAGE_SIZE,
+        )
+    except Exception as exc:
+        raise RetryableTaskError(
+            f"Image auto-generation failed for job {job.job_id}: {exc}"
+        ) from exc
+
+    job.image_path = asset.local_path
+    job.error_message = None
+    db.commit()
+
+    logger.info(
+        "Image regenerated job=%s path=%s bytes=%d",
+        job.job_id,
+        asset.local_path,
+        asset.bytes_written,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +404,8 @@ def generate_image_asset_task(
         result = asdict(asset)
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -243,8 +445,8 @@ def generate_image_for_publish_job_task(
         result = asdict(asset) | {"job_id": job_id}
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -281,9 +483,16 @@ def publish_job_task(
                 error_type="fatal",
             )
             raise FatalError(f"Publish job is cancelled: {job_id}")
-        if not Path(job.image_path).exists():
+
+        # auto-regenerate content + image before publish (every post is fresh)
+        try:
+            run_async(_regenerate_content(job, job.account_id, db))
+            run_async(_generate_fresh_image(job, db))
+        except RetryableTaskError:
+            raise
+        except Exception as exc:
             job.status = "failed"
-            job.error_message = "Image path does not exist"
+            job.error_message = f"Content/image regeneration failed: {exc}"
             job.finished_at = datetime.now(UTC)
             db.commit()
             _st_writeback(
@@ -291,7 +500,7 @@ def publish_job_task(
                 error_message=job.error_message,
                 error_type="fatal",
             )
-            raise FatalError(job.error_message)
+            raise FatalError(job.error_message) from exc
 
         batch_id = content_batch_id or job.content_batch_id or f"batch_{job_id[:12]}"
         job.content_batch_id = batch_id
@@ -385,12 +594,11 @@ def dispatch_publish_jobs_task(limit: int = 20, dry_run: bool = True) -> dict[st
     with get_sessionmaker()() as db:
         result = dispatch_ready_tasks(db, limit=limit, dry_run=dry_run)
     logger.info(
-        "Dispatched %d tasks batch=%s dry_run=%s skipped=%s legacy=%s",
+        "Dispatched %d tasks batch=%s dry_run=%s skipped=%s",
         result["dispatched"],
         result["batch_id"],
         dry_run,
         result["skipped"],
-        result.get("legacy_jobs", 0),
     )
     return result
 
@@ -410,8 +618,8 @@ def refresh_current_event_trends_task(
             result = run_async(refresh_current_event_trends(db, scope=scope, query=query, limit=limit))
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -454,8 +662,8 @@ def refresh_product_trends_task(
             )
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -499,8 +707,8 @@ def generate_marketing_video_task(
         result = asdict(video)
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -535,7 +743,7 @@ def auto_reply_task(
     from app.safety.locks import profile_lock
 
     async def _locked_reply() -> dict[str, Any]:
-        _update_heartbeat(st_id)
+        _update_heartbeat(st_id, account_id)
 
         with get_sessionmaker()() as db:
             account = db.scalar(
@@ -555,7 +763,7 @@ def auto_reply_task(
                 if not prof_held:
                     raise RetryableTaskError(f"Profile lock held: {profile_id}")
 
-                _update_heartbeat(st_id)
+                _update_heartbeat(st_id, account_id, profile_id)
                 session = await open_adspower_profile(profile_id)
                 try:
                     await verify_us_ip(session.page)
@@ -580,8 +788,8 @@ def auto_reply_task(
         result = run_async(_locked_reply())
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -681,7 +889,7 @@ def warmup_task(
         raise FatalError("warmup_task requires account_id")
 
     async def _run() -> dict[str, Any]:
-        _update_heartbeat(st_id)
+        _update_heartbeat(st_id, account_id)
 
         # resolve AdsPower profile
         with get_sessionmaker()() as db:
@@ -707,7 +915,7 @@ def warmup_task(
                         f"Profile lock held by another worker: {profile_id}"
                     )
 
-                _update_heartbeat(st_id)
+                _update_heartbeat(st_id, account_id, profile_id)
                 session = await open_adspower_profile(profile_id)
                 try:
                     result = await run_warmup_session(
@@ -732,8 +940,8 @@ def warmup_task(
         result = run_async(_run())
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -771,9 +979,21 @@ def warmup_and_publish_task(
     from app.safety.locks import account_lock, profile_lock
 
     st_id: str | None = kwargs.pop("scheduled_task_id", None)
+    dry_run: bool = kwargs.pop("dry_run", False)
 
     async def _run() -> dict[str, Any]:
-        _update_heartbeat(st_id)
+        if dry_run:
+            _update_heartbeat(st_id, account_id)
+            result = {
+                "account_id": account_id,
+                "job_id": job_id,
+                "status": "dry_run_skipped",
+                "note": "dry_run=True — browser session skipped",
+            }
+            _st_writeback(st_id, "completed", result_json=result)
+            return result
+
+        _update_heartbeat(st_id, account_id)
 
         with get_sessionmaker()() as db:
             account = db.scalar(
@@ -790,8 +1010,16 @@ def warmup_and_publish_task(
                 raise FatalError(f"Publish job not found: {job_id}")
             if job.status == "cancelled":
                 raise FatalError(f"Publish job cancelled: {job_id}")
-            if not Path(job.image_path).exists():
-                raise FatalError(f"Image path does not exist: {job.image_path}")
+            # Regenerate content + image fresh every publish
+            try:
+                await _regenerate_content(job, account_id, db)
+                await _generate_fresh_image(job, db)
+            except RetryableTaskError:
+                raise
+            except Exception as exc:
+                raise FatalError(
+                    f"Content/image regeneration failed for job {job_id}: {exc}"
+                ) from exc
 
             job.status = "running"
             job.started_at = datetime.now(UTC)
@@ -811,7 +1039,7 @@ def warmup_and_publish_task(
                         f"Profile lock held by another worker: {profile_id}"
                     )
 
-                _update_heartbeat(st_id)
+                _update_heartbeat(st_id, account_id, profile_id)
                 result = await run_warmup_then_publish(
                     account_id=account_id,
                     job_id=job_id,
@@ -843,8 +1071,8 @@ def warmup_and_publish_task(
         result = run_async(_run())
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError:
-        _check_final_retry_and_writeback(st_id)
+    except RetryableTaskError as exc:
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
         _st_writeback(
@@ -931,10 +1159,37 @@ def reclaim_stale_tasks_task(
             st.locked_by = None
             st.lock_until = None
             st.celery_task_id = None
+            st.attempt_count = 0
             st.next_retry_at = now + timedelta(minutes=5)
             st.error_message = (
                 f"Stale task reclaimed after {stale_minutes}min (was {old_status})"
             )
+            reclaimed += 1
+            logger.warning(
+                "Reclaimed stuck task_id=%s type=%s account=%s (was status=%s)",
+                st.task_id,
+                st.task_type,
+                st.account_id,
+                old_status,
+            )
+
+            # Also unstick publish_job if this task owned one
+            job_id = (st.payload_json or {}).get("job_id")
+            if job_id and st.task_type in ("publish", "warmup_and_publish"):
+                from app.models.publish_job import PublishJob
+
+                job = db.scalar(
+                    select(PublishJob).where(PublishJob.job_id == job_id)
+                )
+                if job and job.status == "running":
+                    job.status = "pending"
+                    job.error_message = (
+                        f"Reset after owning task {st.task_id} was reclaimed"
+                    )
+                    logger.warning(
+                        "Reset stuck publish_job %s (was running) after reclaim",
+                        job_id,
+                    )
             reclaimed += 1
             logger.warning(
                 "Reclaimed stuck task_id=%s type=%s account=%s (was status=%s)",

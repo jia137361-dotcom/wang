@@ -8,9 +8,9 @@ class PublishJobCreate(BaseModel):
     account_id: str = Field(max_length=64)
     campaign_id: str | None = Field(default=None, max_length=64)
     board_name: str = Field(max_length=160)
-    image_path: Path
-    title: str = Field(max_length=160)
-    description: str
+    image_path: Path | None = Field(default=None)
+    title: str = Field(default="", max_length=160)
+    description: str = Field(default="")
     destination_url: str | None = Field(default=None, max_length=1024)
     product_type: str = Field(max_length=80)
     niche: str = Field(max_length=120)

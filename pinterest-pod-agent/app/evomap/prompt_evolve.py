@@ -174,6 +174,112 @@ Output:
    and misleading claims.
 """.strip()
 
+    # -- single-candidate content prompt (1 instead of 8) --------------------
+
+    def build_simple_content_prompt(self, context: PromptContext) -> str:
+        signals = self.get_keyword_signals(
+            niche=context.niche,
+            product_type=context.product_type,
+        )
+        keyword_text = self._format_signals(signals)
+        season_text = context.season or "no seasonal theme"
+        offer_text = context.offer or "no discount specified"
+
+        return f"""
+You are generating ONE Pinterest Pin title and description for a POD product.
+Use the EvoMap historical feedback signals below to guide word choice.
+
+Product type: {context.product_type}
+Niche / market: {context.niche}
+Target audience: {context.audience}
+Season / occasion: {season_text}
+Offer / promo: {offer_text}
+
+EvoMap high-CTR keyword signals (weighted by click feedback):
+{keyword_text}
+
+Output exactly ONE JSON object (no array, no markdown fences):
+{{
+  "title": "Pinterest title, max 95 chars, attention-grabbing, English",
+  "description": "SEO description, 350-500 chars, naturally weaving 2-3 high-weight keywords, English"
+}}
+""".strip()
+
+    async def agenerate_single_content(
+        self, context: PromptContext
+    ) -> dict[str, str]:
+        """Generate exactly ONE title+description pair via LLM."""
+        import json as _json
+
+        prompt = self.build_simple_content_prompt(context)
+        raw = await self.volc_client.agenerate_text(
+            prompt,
+            system_prompt="你只输出 JSON，不输出任何其他内容。",
+            temperature=0.8,
+            max_tokens=800,
+        )
+        # Parse: strip fences, extract JSON
+        raw = raw.strip()
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines)
+        try:
+            data = _json.loads(raw)
+        except _json.JSONDecodeError:
+            return {}
+        return {
+            "title": str(data.get("title", "")),
+            "description": str(data.get("description", "")),
+        }
+
+    # -- single visual prompt (1 instead of 3) --------------------------------
+
+    def build_single_visual_prompt(self, context: PromptContext) -> str:
+        signals = self.get_keyword_signals(
+            niche=context.niche,
+            product_type=context.product_type,
+        )
+        keyword_text = self._format_signals(signals)
+
+        return f"""
+You are generating ONE image-generation prompt for a POD product.
+Translate the high-CTR keyword signals below into visual direction for Flux 2 Pro.
+
+Product type: {context.product_type}
+Niche / market: {context.niche}
+Target audience: {context.audience}
+EvoMap keyword signals:
+{keyword_text}
+
+Output:
+1. Exactly ONE English image-generation prompt, 50-200 words.
+2. Describe composition, main subject, colour palette, lighting, typography
+   style, and best POD product carrier (poster, mug, t-shirt, etc.).
+3. Suited for Pinterest vertical format (2:3 aspect ratio).
+4. Avoid trademarked characters, celebrity likeness, copyrighted mascots.
+5. Output ONLY the raw prompt string. No markdown, no labels, no quotes.
+""".strip()
+
+    async def agenerate_visual_brief(self, context: PromptContext) -> str:
+        """Generate exactly ONE Flux image-generation prompt via LLM."""
+        meta_prompt = self.build_single_visual_prompt(context)
+        raw = await self.volc_client.agenerate_text(
+            meta_prompt,
+            system_prompt=(
+                "You are an expert visual prompt engineer for Flux image models. "
+                "Output only the raw prompt string, no markup, no explanation."
+            ),
+            temperature=0.8,
+            max_tokens=400,
+        )
+        return raw.strip().strip('"').strip("'").strip()
+
+    # -- existing methods ----------------------------------------------------
+
     def generate_content_brief(self, context: PromptContext) -> str:
         prompt = self.build_content_prompt(context)
         return self.volc_client.generate_text(

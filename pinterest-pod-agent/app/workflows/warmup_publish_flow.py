@@ -63,9 +63,6 @@ async def run_warmup_then_publish(
         job = db.scalar(select(PublishJob).where(PublishJob.job_id == job_id))
         if job is None:
             raise ValueError(f"PublishJob not found: {job_id}")
-        if not Path(job.image_path).exists():
-            raise FileNotFoundError(f"Image path does not exist: {job.image_path}")
-
         # Build workflow input while we have the DB session
         publish_input = AccountPublishWorkflowInput(
             account_id=job.account_id,

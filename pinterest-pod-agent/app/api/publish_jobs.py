@@ -60,10 +60,14 @@ def generate_deduped_content(
 
 @router.post("/", response_model=PublishJobRead, status_code=status.HTTP_201_CREATED)
 def create_publish_job(payload: PublishJobCreate, db: Session = Depends(get_db)) -> PublishJob:
+    image_path = str(payload.image_path) if payload.image_path else "pending_auto_generation"
+    data = payload.model_dump(exclude={"image_path"})
+    data["title"] = data.get("title") or "pending_auto_generation"
+    data["description"] = data.get("description") or "pending_auto_generation"
     job = PublishJob(
         job_id=f"job_{uuid4().hex[:16]}",
-        image_path=str(payload.image_path),
-        **payload.model_dump(exclude={"image_path"}),
+        image_path=image_path,
+        **data,
     )
     db.add(job)
     db.commit()
@@ -101,12 +105,6 @@ def prepare_publish_job_run(job_id: str, db: Session = Depends(get_db)) -> Publi
     job = _get_job(db, job_id)
     if job.status == "cancelled":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job is cancelled")
-    if not Path(job.image_path).exists():
-        job.status = "failed"
-        job.error_message = "Image path does not exist"
-        job.finished_at = datetime.now(UTC)
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=job.error_message)
 
     job.status = "ready"
     job.started_at = datetime.now(UTC)

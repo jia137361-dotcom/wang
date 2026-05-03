@@ -26,6 +26,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import redis
 import redis.asyncio as aioredis
 
 from app.config import get_settings
@@ -125,6 +126,50 @@ for i = 1, #KEYS do
 end
 return 1
 """
+
+
+async def renew_locks_once(
+    account_id: str,
+    profile_id: str | None = None,
+    *,
+    ttl: int = DEFAULT_LOCK_TTL_SECONDS,
+) -> None:
+    """Renew Redis lock TTLs once (non-looping variant of renew_locks)."""
+    redis = await _get_redis()
+    owner = _worker_id()
+    try:
+        account_key = f"{LOCK_PREFIX}:account:{account_id}"
+        await redis.eval(_RENEW_SCRIPT, 1, account_key, owner, str(ttl))
+        if profile_id:
+            profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
+            await redis.eval(_RENEW_SCRIPT, 1, profile_key, owner, str(ttl))
+        logger.debug("locks renewed once account=%s profile=%s", account_id, profile_id)
+    finally:
+        await redis.aclose()
+
+
+def renew_locks_once_sync(
+    account_id: str,
+    profile_id: str | None = None,
+    *,
+    ttl: int = DEFAULT_LOCK_TTL_SECONDS,
+) -> None:
+    """Synchronous variant of renew_locks_once — safe to call from any context
+    including inside an already-running event loop (no nested loop)."""
+    settings = get_settings()
+    r = redis.from_url(settings.redis_url, decode_responses=True)
+    owner = _worker_id()
+    try:
+        account_key = f"{LOCK_PREFIX}:account:{account_id}"
+        if r.get(account_key) == owner:
+            r.expire(account_key, ttl)
+        if profile_id:
+            profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
+            if r.get(profile_key) == owner:
+                r.expire(profile_key, ttl)
+        logger.debug("locks renewed sync account=%s profile=%s", account_id, profile_id)
+    finally:
+        r.close()
 
 
 async def renew_locks(
