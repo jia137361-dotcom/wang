@@ -88,12 +88,15 @@ async def run_pin_publish_with_adspower(
     if not account.adspower_profile_id:
         raise ValueError(f"Account has no AdsPower profile bound: {workflow_input.account_id}")
 
+    from app.safety.proxy_check import verify_us_ip
+
     session: BrowserSession | None = None
     try:
         session = await open_adspower_profile(
             account.adspower_profile_id,
             adspower_client=adspower_client,
         )
+        await verify_us_ip(session.page)
         pinterest = PinterestFlow(session.page)
         evolver = PromptEvolver(db=db)
         content_prompt = evolver.build_content_prompt(workflow_input.prompt_context)

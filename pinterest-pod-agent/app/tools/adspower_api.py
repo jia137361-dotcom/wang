@@ -150,7 +150,8 @@ class AdsPowerClient:
 
     def _get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        with httpx.Client(timeout=self.timeout_seconds) as client:
+        transport = httpx.HTTPTransport(retries=0)
+        with httpx.Client(timeout=self.timeout_seconds, transport=transport) as client:
             response = client.get(url, params=params, headers=self._headers())
         try:
             response.raise_for_status()

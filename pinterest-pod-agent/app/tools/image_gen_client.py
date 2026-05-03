@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -13,11 +14,11 @@ except ImportError:  # pragma: no cover - depends on optional runtime package.
 
 logger = logging.getLogger(__name__)
 
-BASE_IMAGE_ENDPOINT = "fal-ai/flux/schnell"
+BASE_IMAGE_ENDPOINT = "fal-ai/flux-2-pro"
 UPSCALE_ENDPOINT = "fal-ai/esrgan"
-DEFAULT_UPSCALE_SCALE = 4
-DEFAULT_TIMEOUT_SECONDS = 180.0
-DEFAULT_START_TIMEOUT_SECONDS = 30.0
+DEFAULT_UPSCALE_SCALE = 2
+DEFAULT_TIMEOUT_SECONDS = 360.0
+DEFAULT_START_TIMEOUT_SECONDS = 60.0
 
 
 class ImageGenerationError(RuntimeError):
@@ -73,15 +74,17 @@ class ImageGenClient:
             raise
 
     async def _generate_base_image(self, prompt: str, image_size: str) -> str:
-        """步骤 1：使用低成本 flux/schnell 生成基础图片。"""
+        """Step 1: generate a high-quality base image with Flux 2 Pro."""
+        size = _parse_image_size(image_size)
         try:
             result = await self.client.subscribe(
                 BASE_IMAGE_ENDPOINT,
                 arguments={
                     "prompt": prompt,
-                    "image_size": image_size,
+                    "image_size": size,
                     "num_images": 1,
-                    "num_inference_steps": 4,
+                    "num_inference_steps": 28,
+                    "guidance_scale": 3.5,
                     "enable_safety_checker": True,
                     "output_format": "png",
                 },
@@ -141,6 +144,21 @@ async def generate_high_res_image(prompt: str, image_size: str) -> str:
     """模块级主函数，供 API、workflow 或 Celery wrapper 调用。"""
     client = ImageGenClient()
     return await client.generate_high_res_image(prompt, image_size)
+
+
+def _parse_image_size(image_size: str) -> str | dict[str, int]:
+    """Parse *image_size* as a JSON dict ``{width, height}`` if it looks like
+    JSON, otherwise return the raw string (used for named presets like
+    ``portrait_16_9``)."""
+    stripped = image_size.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and "width" in parsed and "height" in parsed:
+                return {"width": int(parsed["width"]), "height": int(parsed["height"])}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return image_size
 
 
 def _build_fal_async_client(timeout_seconds: float) -> Any:

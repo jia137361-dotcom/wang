@@ -206,3 +206,62 @@ CREATE INDEX IF NOT EXISTS ix_token_usage_campaign_id
 
 CREATE INDEX IF NOT EXISTS ix_token_usage_request_type
     ON token_usage (request_type);
+
+-- ============================================================
+-- scheduled_task and account_policy tables are managed by
+-- Alembic migration: migrations/versions/0003_scheduled_task.py
+-- The commented DDL below is kept as reference only.
+-- Use `alembic upgrade head` for production schema management.
+-- ============================================================
+
+-- CREATE TABLE IF NOT EXISTS scheduled_task (
+--     id SERIAL PRIMARY KEY,
+--     task_id VARCHAR(64) NOT NULL UNIQUE,
+--     task_type VARCHAR(40) NOT NULL,
+--     platform VARCHAR(40) NOT NULL DEFAULT 'pinterest',
+--     account_id VARCHAR(64),
+--     campaign_id VARCHAR(64),
+--     status VARCHAR(40) NOT NULL DEFAULT 'pending',
+--     priority INTEGER NOT NULL DEFAULT 0,
+--     scheduled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+--     started_at TIMESTAMPTZ,
+--     finished_at TIMESTAMPTZ,
+--     attempt_count INTEGER NOT NULL DEFAULT 0,
+--     max_attempts INTEGER NOT NULL DEFAULT 3,
+--     next_retry_at TIMESTAMPTZ,
+--     locked_by VARCHAR(64),
+--     lock_until TIMESTAMPTZ,
+--     heartbeat_at TIMESTAMPTZ,
+--     celery_task_id VARCHAR(128),
+--     payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+--     result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+--     error_message TEXT,
+--     error_type VARCHAR(40),
+--     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+--     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-- );
+--
+-- CREATE INDEX IF NOT EXISTS ix_scheduled_task_task_id ON scheduled_task (task_id);
+-- CREATE INDEX IF NOT EXISTS ix_st_status_scheduled ON scheduled_task (status, scheduled_at);
+-- CREATE INDEX IF NOT EXISTS ix_st_account_status ON scheduled_task (account_id, status);
+-- CREATE INDEX IF NOT EXISTS ix_st_locked_by ON scheduled_task (locked_by);
+-- CREATE INDEX IF NOT EXISTS ix_scheduled_task_task_type ON scheduled_task (task_type);
+-- CREATE INDEX IF NOT EXISTS ix_scheduled_task_campaign_id ON scheduled_task (campaign_id);
+--
+-- CREATE TABLE IF NOT EXISTS account_policy (
+--     id SERIAL PRIMARY KEY,
+--     account_id VARCHAR(64) NOT NULL UNIQUE,
+--     platform VARCHAR(40) NOT NULL DEFAULT 'pinterest',
+--     daily_max_posts INTEGER NOT NULL DEFAULT 3,
+--     min_post_interval_min INTEGER NOT NULL DEFAULT 60,
+--     allowed_timezone_start VARCHAR(5) DEFAULT '09:00',
+--     allowed_timezone_end VARCHAR(5) DEFAULT '22:00',
+--     auto_reply_enabled BOOLEAN NOT NULL DEFAULT false,
+--     warmup_sessions_per_day INTEGER NOT NULL DEFAULT 2,
+--     warmup_duration_min INTEGER NOT NULL DEFAULT 15,
+--     cooldown_until TIMESTAMPTZ,
+--     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+--     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-- );
+--
+-- CREATE INDEX IF NOT EXISTS ix_account_policy_account_id ON account_policy (account_id);

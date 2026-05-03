@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 
 from pydantic import Field
@@ -45,10 +46,11 @@ class Settings(BaseSettings):
     adspower_timeout_seconds: float = Field(default=30.0, validation_alias="ADSPOWER_TIMEOUT_SECONDS")
     upload_dir: str = Field(default="var/uploads", validation_alias="UPLOAD_DIR")
     max_upload_size_mb: int = Field(default=20, validation_alias="MAX_UPLOAD_SIZE_MB")
-    scheduler_enabled: bool = Field(default=False, validation_alias="SCHEDULER_ENABLED")
+    scheduler_enabled: bool = Field(default=True, validation_alias="SCHEDULER_ENABLED")
     scheduler_timezone: str = Field(default="Asia/Shanghai", validation_alias="SCHEDULER_TIMEZONE")
     publish_interval_minutes: int = Field(default=30, validation_alias="PUBLISH_INTERVAL_MINUTES")
     scheduler_dry_run: bool = Field(default=True, validation_alias="SCHEDULER_DRY_RUN")
+    redis_url: str = Field(default="redis://localhost:6379", validation_alias="REDIS_URL")
     celery_broker_url: str = Field(default="redis://localhost:6379/0", validation_alias="CELERY_BROKER_URL")
     celery_result_backend: str = Field(default="redis://localhost:6379/1", validation_alias="CELERY_RESULT_BACKEND")
     fal_key: str | None = Field(default=None, validation_alias="FAL_KEY")
@@ -65,4 +67,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    if settings.fal_key and not os.environ.get("FAL_KEY"):
+        os.environ["FAL_KEY"] = settings.fal_key
+    return settings

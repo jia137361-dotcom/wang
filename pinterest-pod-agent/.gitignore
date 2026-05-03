@@ -9,3 +9,5 @@ playwright-report/
 test-results/
 var/uploads/
 var/debug/
+var/adspower/
+celerybeat-schedule*
