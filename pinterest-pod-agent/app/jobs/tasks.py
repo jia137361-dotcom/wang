@@ -1190,14 +1190,6 @@ def reclaim_stale_tasks_task(
                         "Reset stuck publish_job %s (was running) after reclaim",
                         job_id,
                     )
-            reclaimed += 1
-            logger.warning(
-                "Reclaimed stuck task_id=%s type=%s account=%s (was status=%s)",
-                st.task_id,
-                st.task_type,
-                st.account_id,
-                old_status,
-            )
 
         db.commit()
 

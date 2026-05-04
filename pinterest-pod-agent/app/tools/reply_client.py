@@ -56,7 +56,12 @@ class PinterestReplyClient:
     async def fetch_unreplied_comments(
         self, *, account_id: str, limit: int = 20
     ) -> list[SocialComment]:
-        """Navigate to Pinterest notifications and extract recent comments."""
+        """Navigate to Pinterest notifications and extract recent comments.
+
+        De-duplication and reply history are handled by ``ReplyRecord`` in the
+        workflow layer because Pinterest notifications do not expose a stable
+        "already replied" marker across UI variants.
+        """
         if self.page is None:
             logger.warning("No browser page available for comment fetch")
             return []
@@ -149,9 +154,16 @@ class PinterestReplyClient:
             await page.wait_for_timeout(500)
 
             submit_btn = await page.query_selector(_REPLY_SUBMIT)
-            if submit_btn:
-                await submit_btn.click()
-                await page.wait_for_timeout(2000)
+            if not submit_btn:
+                return ReplyPostResult(
+                    comment_id=comment_id,
+                    reply_text=reply_text,
+                    posted=False,
+                    raw={"error": "Reply submit button not found", "pin_url": pin_url},
+                )
+
+            await submit_btn.click()
+            await page.wait_for_timeout(2000)
 
             logger.info("Posted reply for comment=%s", comment_id)
             return ReplyPostResult(

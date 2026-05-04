@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     fal_key: str | None = Field(default=None, validation_alias="FAL_KEY")
     video_provider_api_key: str | None = Field(default=None, validation_alias="VIDEO_PROVIDER_API_KEY")
     trend_provider_api_key: str | None = Field(default=None, validation_alias="TREND_PROVIDER_API_KEY")
+    pinterest_api_key: str | None = Field(default=None, validation_alias="PINTEREST_API_KEY")
+    pinterest_trends_enabled: bool = Field(default=False, validation_alias="PINTEREST_TRENDS_ENABLED")
+    pinterest_trends_base_url: str = Field(
+        default="https://api.pinterest.com/v5",
+        validation_alias="PINTEREST_TRENDS_BASE_URL",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

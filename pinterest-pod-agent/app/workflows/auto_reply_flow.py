@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 from playwright.async_api import Page
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from app.database import get_sessionmaker
+from app.models.reply_record import ReplyRecord
 from app.tools.reply_client import PinterestReplyClient, ReplyPostResult, SocialComment
 
 logger = logging.getLogger(__name__)
@@ -17,6 +23,8 @@ class ReplySuggestion:
     comment_id: str
     comment_text: str
     reply_text: str
+    safety_status: str = "safe"
+    safety_reason: str | None = None
     posted: bool = False
 
 
@@ -36,6 +44,7 @@ async def run_auto_reply_flow(
     limit: int = 20,
     brand_voice: str | None = None,
     niche: str | None = None,
+    db: Session | None = None,
 ) -> AutoReplyResult:
     """Fetch unreplied comments, generate LLM replies, optionally post."""
     client = PinterestReplyClient(page=page)
@@ -43,46 +52,191 @@ async def run_auto_reply_flow(
         account_id=account_id, limit=limit
     )
 
-    suggestions: list[ReplySuggestion] = []
-    for comment in comments:
-        reply_text = await _generate_reply(comment, brand_voice=brand_voice, niche=niche)
-        suggestions.append(
-            ReplySuggestion(
-                comment_id=comment.comment_id,
-                comment_text=comment.text,
-                reply_text=reply_text,
-                posted=False,
-            )
-        )
+    owns_db = db is None
+    db = db or get_sessionmaker()()
+    try:
+        suggestions: list[ReplySuggestion] = []
+        for comment in comments:
+            existing = _get_reply_record(db, account_id=account_id, comment_id=comment.comment_id)
+            if existing and existing.status in {"posted", "suggested", "manual_review"}:
+                logger.info(
+                    "Skipping previously handled comment=%s account=%s status=%s",
+                    comment.comment_id,
+                    account_id,
+                    existing.status,
+                )
+                continue
 
-    if dry_run:
+            safety_status, safety_reason = classify_comment_safety(comment.text)
+            if safety_status != "safe":
+                _upsert_reply_record(
+                    db,
+                    comment=comment,
+                    reply_text=None,
+                    status="manual_review",
+                    safety_status=safety_status,
+                    safety_reason=safety_reason,
+                )
+                suggestions.append(
+                    ReplySuggestion(
+                        comment_id=comment.comment_id,
+                        comment_text=comment.text,
+                        reply_text="",
+                        safety_status=safety_status,
+                        safety_reason=safety_reason,
+                        posted=False,
+                    )
+                )
+                continue
+
+            reply_text = await _generate_reply(comment, brand_voice=brand_voice, niche=niche)
+            _upsert_reply_record(
+                db,
+                comment=comment,
+                reply_text=reply_text,
+                status="suggested",
+                safety_status="safe",
+                safety_reason=None,
+            )
+            suggestions.append(
+                ReplySuggestion(
+                    comment_id=comment.comment_id,
+                    comment_text=comment.text,
+                    reply_text=reply_text,
+                    posted=False,
+                )
+            )
+
+        if dry_run:
+            return AutoReplyResult(
+                account_id=account_id,
+                dry_run=True,
+                suggestions=suggestions,
+                posted=[],
+            )
+
+        posted: list[ReplyPostResult] = []
+        for suggestion in suggestions:
+            if suggestion.safety_status != "safe" or not suggestion.reply_text:
+                continue
+            pin_url = next(
+                (c.pin_url for c in comments if c.comment_id == suggestion.comment_id),
+                None,
+            )
+            result = await client.publish_reply(
+                comment_id=suggestion.comment_id,
+                reply_text=suggestion.reply_text,
+                pin_url=pin_url,
+            )
+            _mark_reply_post_result(db, account_id=account_id, result=result)
+            posted.append(result)
+
         return AutoReplyResult(
             account_id=account_id,
-            dry_run=True,
+            dry_run=False,
             suggestions=suggestions,
-            posted=[],
+            posted=posted,
         )
+    finally:
+        if owns_db:
+            db.close()
 
-    posted: list[ReplyPostResult] = []
-    for suggestion in suggestions:
-        # find the original comment to get its pin_url
-        pin_url = next(
-            (c.pin_url for c in comments if c.comment_id == suggestion.comment_id),
-            None,
-        )
-        result = await client.publish_reply(
-            comment_id=suggestion.comment_id,
-            reply_text=suggestion.reply_text,
-            pin_url=pin_url,
-        )
-        posted.append(result)
 
-    return AutoReplyResult(
-        account_id=account_id,
-        dry_run=False,
-        suggestions=suggestions,
-        posted=posted,
+def classify_comment_safety(text: str) -> tuple[str, str | None]:
+    normalized = text.lower()
+    manual_review_markers = {
+        "refund": "refund_or_order_issue",
+        "return": "refund_or_order_issue",
+        "chargeback": "refund_or_order_issue",
+        "scam": "complaint",
+        "complaint": "complaint",
+        "stolen": "copyright_or_ip",
+        "copyright": "copyright_or_ip",
+        "trademark": "copyright_or_ip",
+        "lawsuit": "legal",
+        "sue": "legal",
+        "price": "pricing_dispute",
+        "too expensive": "pricing_dispute",
+        "account hacked": "account_security",
+        "password": "account_security",
+        "退款": "refund_or_order_issue",
+        "退货": "refund_or_order_issue",
+        "投诉": "complaint",
+        "侵权": "copyright_or_ip",
+        "版权": "copyright_or_ip",
+        "商标": "copyright_or_ip",
+        "太贵": "pricing_dispute",
+        "账号": "account_security",
+    }
+    for marker, reason in manual_review_markers.items():
+        if marker in normalized:
+            return "manual_review", reason
+    return "safe", None
+
+
+def _get_reply_record(db: Session, *, account_id: str, comment_id: str) -> ReplyRecord | None:
+    return db.scalar(
+        select(ReplyRecord).where(
+            ReplyRecord.account_id == account_id,
+            ReplyRecord.comment_id == comment_id,
+        )
     )
+
+
+def _upsert_reply_record(
+    db: Session,
+    *,
+    comment: SocialComment,
+    reply_text: str | None,
+    status: str,
+    safety_status: str,
+    safety_reason: str | None,
+) -> ReplyRecord:
+    record = _get_reply_record(
+        db,
+        account_id=comment.account_id,
+        comment_id=comment.comment_id,
+    )
+    raw: dict[str, Any] = {
+        "pin_url": comment.pin_url,
+        "author_name": comment.author_name,
+    }
+    if record is None:
+        record = ReplyRecord(
+            account_id=comment.account_id,
+            comment_id=comment.comment_id,
+            pin_url=comment.pin_url,
+            author_name=comment.author_name,
+            comment_text=comment.text,
+            reply_text=reply_text,
+            status=status,
+            safety_status=safety_status,
+            safety_reason=safety_reason,
+            raw_json=raw,
+        )
+        db.add(record)
+    else:
+        record.pin_url = comment.pin_url
+        record.author_name = comment.author_name
+        record.comment_text = comment.text
+        record.reply_text = reply_text
+        record.status = status
+        record.safety_status = safety_status
+        record.safety_reason = safety_reason
+        record.raw_json = raw
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def _mark_reply_post_result(db: Session, *, account_id: str, result: ReplyPostResult) -> None:
+    record = _get_reply_record(db, account_id=account_id, comment_id=result.comment_id)
+    if record is None:
+        return
+    record.status = "posted" if result.posted else "failed"
+    record.posted_at = datetime.now(UTC) if result.posted else None
+    record.raw_json = result.raw
+    db.commit()
 
 
 async def _generate_reply(

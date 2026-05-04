@@ -551,6 +551,251 @@ def auto_schedule_daily(
 
 
 # ---------------------------------------------------------------------------
+# 8. operational status and trend helpers
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def check_health() -> dict[str, Any]:
+    """Check PostgreSQL, Redis, and AdsPower local API reachability."""
+    health: dict[str, Any] = {"status": "ok", "checks": {}}
+
+    try:
+        from sqlalchemy import text
+
+        db = _db()
+        try:
+            db.execute(text("SELECT 1"))
+            health["checks"]["database"] = {"ok": True}
+        finally:
+            db.close()
+    except Exception as exc:
+        health["status"] = "degraded"
+        health["checks"]["database"] = {"ok": False, "error": str(exc)}
+
+    try:
+        import redis
+
+        from app.config import get_settings
+
+        r = redis.from_url(get_settings().redis_url, decode_responses=True)
+        try:
+            health["checks"]["redis"] = {"ok": bool(r.ping())}
+        finally:
+            r.close()
+    except Exception as exc:
+        health["status"] = "degraded"
+        health["checks"]["redis"] = {"ok": False, "error": str(exc)}
+
+    try:
+        from app.tools.adspower_api import AdsPowerClient
+
+        client = AdsPowerClient(timeout_seconds=3.0)
+        client._get("/status")  # type: ignore[attr-defined]
+        health["checks"]["adspower"] = {"ok": True}
+    except Exception as exc:
+        health["status"] = "degraded"
+        health["checks"]["adspower"] = {"ok": False, "error": str(exc)}
+
+    return health
+
+
+@mcp.tool()
+def check_account_proxies(account_ids: list[str] | None = None) -> dict[str, Any]:
+    """Check account to AdsPower profile bindings and local profile status."""
+    from sqlalchemy import select
+
+    from app.models.social_account import SocialAccount
+    from app.tools.adspower_api import AdsPowerClient
+
+    db = _db()
+    try:
+        stmt = select(SocialAccount)
+        if account_ids:
+            stmt = stmt.where(SocialAccount.account_id.in_(account_ids))
+        accounts = list(db.scalars(stmt).all())
+    finally:
+        db.close()
+
+    client = AdsPowerClient(timeout_seconds=5.0)
+    results: list[dict[str, Any]] = []
+    for account in accounts:
+        item: dict[str, Any] = {
+            "account_id": account.account_id,
+            "proxy_region": account.proxy_region,
+            "adspower_profile_id": account.adspower_profile_id,
+            "ok": False,
+        }
+        if not account.adspower_profile_id:
+            item["error"] = "No AdsPower profile bound"
+            results.append(item)
+            continue
+        try:
+            status = client.get_profile_status(account.adspower_profile_id)
+            item.update(
+                {
+                    "ok": True,
+                    "profile_status": status.status,
+                    "debug_port": status.debug_port,
+                    "has_browser_endpoint": bool(status.ws_puppeteer),
+                }
+            )
+        except Exception as exc:
+            item["error"] = str(exc)
+        results.append(item)
+
+    return {"checked": len(results), "accounts": results}
+
+
+@mcp.tool()
+def list_tasks(
+    account_id: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List scheduled tasks by account/status/type."""
+    from sqlalchemy import select
+
+    from app.models.scheduled_task import ScheduledTask
+
+    db = _db()
+    try:
+        stmt = select(ScheduledTask).order_by(ScheduledTask.scheduled_at.desc()).limit(limit)
+        if account_id:
+            stmt = stmt.where(ScheduledTask.account_id == account_id)
+        if status:
+            stmt = stmt.where(ScheduledTask.status == status)
+        if task_type:
+            stmt = stmt.where(ScheduledTask.task_type == task_type)
+        rows = list(db.scalars(stmt).all())
+        return {
+            "items": [
+                {
+                    "task_id": t.task_id,
+                    "task_type": t.task_type,
+                    "account_id": t.account_id,
+                    "status": t.status,
+                    "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else None,
+                    "started_at": t.started_at.isoformat() if t.started_at else None,
+                    "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+                    "error_message": t.error_message,
+                }
+                for t in rows
+            ],
+            "count": len(rows),
+        }
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def get_task_detail(task_id: str) -> dict[str, Any]:
+    """Alias for get_task_status with a clearer nanobot-facing name."""
+    return get_task_status(task_id)
+
+
+@mcp.tool()
+def get_recent_errors(hours: int = 4, limit: int = 20) -> dict[str, Any]:
+    """Return recent failed scheduled tasks."""
+    from sqlalchemy import select
+
+    from app.models.scheduled_task import ScheduledTask
+
+    cutoff = _now() - timedelta(hours=hours)
+    db = _db()
+    try:
+        rows = list(
+            db.scalars(
+                select(ScheduledTask)
+                .where(
+                    ScheduledTask.status == "failed",
+                    ScheduledTask.finished_at >= cutoff,
+                )
+                .order_by(ScheduledTask.finished_at.desc())
+                .limit(limit)
+            ).all()
+        )
+        return {
+            "hours": hours,
+            "items": [
+                {
+                    "task_id": t.task_id,
+                    "task_type": t.task_type,
+                    "account_id": t.account_id,
+                    "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+                    "error_type": t.error_type,
+                    "error_message": t.error_message,
+                }
+                for t in rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def get_status_dashboard() -> dict[str, Any]:
+    """Today's per-account task dashboard."""
+    return get_account_runtime_status()
+
+
+@mcp.tool()
+def get_trend_snapshot(scope: str) -> dict[str, Any]:
+    """Read the stored trend strategy snapshot for a scope."""
+    from app.evomap.strategy_matrix import get_strategy
+
+    db = _db()
+    try:
+        return {"scope": scope, "strategy": get_strategy(db, scope)}
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def refresh_pinterest_trends(
+    scope: str,
+    trend_type: str = "product",
+    query: str | None = None,
+    niche: str | None = None,
+    product_type: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Queue a Pinterest trend refresh task."""
+    from app.jobs.tasks import refresh_current_event_trends_task, refresh_product_trends_task
+
+    if trend_type == "current_events":
+        result = refresh_current_event_trends_task.delay(scope, query, limit)
+        task_name = "app.jobs.refresh_current_event_trends"
+    else:
+        result = refresh_product_trends_task.delay(scope, niche, product_type, limit)
+        task_name = "app.jobs.refresh_product_trends"
+    return {
+        "celery_task_id": getattr(result, "id", None),
+        "task_name": task_name,
+        "scope": scope,
+        "trend_type": trend_type,
+    }
+
+
+@mcp.tool()
+def generate_image(
+    prompt: str,
+    image_size: str = '{"width": 800, "height": 1200}',
+) -> dict[str, Any]:
+    """Queue a Fal.ai image generation task."""
+    from app.jobs.tasks import generate_image_asset_task
+
+    result = generate_image_asset_task.delay(prompt, image_size)
+    return {
+        "celery_task_id": getattr(result, "id", None),
+        "task_name": "app.jobs.generate_image_asset",
+        "prompt": prompt,
+        "image_size": image_size,
+    }
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from app.evomap.strategy_matrix import get_strategy, upsert_strategy
-from app.tools.trend_sources import CurrentEventsTrendClient, ProductTrendClient, TrendSignal
+from app.tools.trend_sources import CurrentEventsTrendClient, ProductTrendClient, TrendFetchResult, TrendSignal
 
 
 async def refresh_current_event_trends(
@@ -16,13 +16,13 @@ async def refresh_current_event_trends(
     limit: int = 20,
 ) -> dict:
     """刷新时事趋势；外部数据源未配置时会写入空结果快照。"""
-    signals = await CurrentEventsTrendClient().fetch(query=query, limit=limit)
+    fetch_result = await CurrentEventsTrendClient().fetch_result(query=query, limit=limit)
     return _store_trend_signals(
         db,
         scope=scope,
         bucket="current_event_trends",
         source_type="current_events",
-        signals=signals,
+        fetch_result=fetch_result,
     )
 
 
@@ -35,13 +35,15 @@ async def refresh_product_trends(
     limit: int = 20,
 ) -> dict:
     """刷新爆品趋势；外部数据源未配置时会写入空结果快照。"""
-    signals = await ProductTrendClient().fetch(niche=niche, product_type=product_type, limit=limit)
+    fetch_result = await ProductTrendClient().fetch_result(
+        niche=niche, product_type=product_type, limit=limit
+    )
     return _store_trend_signals(
         db,
         scope=scope,
         bucket="product_trends",
         source_type="product_trends",
-        signals=signals,
+        fetch_result=fetch_result,
     )
 
 
@@ -51,9 +53,13 @@ def _store_trend_signals(
     scope: str,
     bucket: str,
     source_type: str,
-    signals: list[TrendSignal],
+    signals: list[TrendSignal] | None = None,
+    fetch_result: TrendFetchResult | None = None,
 ) -> dict:
     strategy = get_strategy(db, scope)
+    if fetch_result is not None:
+        signals = fetch_result.signals
+    signals = signals or []
     normalized = [
         {
             "keyword": " ".join(signal.keyword.lower().split()),
@@ -72,9 +78,19 @@ def _store_trend_signals(
         {
             "source": source_type,
             "count": len(normalized),
+            "provider": fetch_result.provider if fetch_result else "manual",
+            "status": fetch_result.status if fetch_result else "ok",
             "recorded_at": datetime.now(UTC).isoformat(),
         }
     )
     strategy["trend_history"] = history[-50:]
+    strategy["trend_source_status"] = {
+        "bucket": bucket,
+        "source": source_type,
+        "provider": fetch_result.provider if fetch_result else "manual",
+        "status": fetch_result.status if fetch_result else "ok",
+        "metadata": fetch_result.metadata if fetch_result else {},
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
     upsert_strategy(db, scope, strategy, version=strategy.get("version", source_type))
     return strategy
