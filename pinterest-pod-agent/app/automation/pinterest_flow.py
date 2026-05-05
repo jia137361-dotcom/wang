@@ -215,12 +215,15 @@ class PinterestFlow:
             await self.page.goto(url, wait_until="domcontentloaded")
             if await self._has_file_input(timeout_ms=20_000):
                 await self._wait_for_creator_form()
+                # Let Pinterest React hydrate so the file input's change handler is wired up.
+                await self.page.wait_for_timeout(3000)
                 return
         await self.page.goto("https://www.pinterest.com/", wait_until="domcontentloaded")
         try:
             await self._open_pin_creator_from_create_menu()
             if await self._has_file_input(timeout_ms=20_000):
                 await self._wait_for_creator_form()
+                await self.page.wait_for_timeout(3000)
                 return
         except Exception:
             logger.info("Pinterest create menu entry failed after direct creator URLs", exc_info=True)
@@ -281,7 +284,9 @@ class PinterestFlow:
         while datetime.now(UTC).timestamp() < deadline:
             if await self._has_uploaded_preview():
                 await self.page.wait_for_timeout(500)
-                return
+                # Verify the title input is actually enabled before returning
+                if await self._is_title_input_enabled():
+                    return
             try:
                 placeholder = self.page.locator("text=Choose a file or drag and drop it here").first
                 if await placeholder.count() == 0 or not await placeholder.is_visible():
@@ -292,6 +297,16 @@ class PinterestFlow:
                 pass
             await self.page.wait_for_timeout(500)
         logger.warning("Upload preview not detected within deadline; continuing with form fill")
+
+    async def _is_title_input_enabled(self) -> bool:
+        """Check that the storyboard title input is not disabled."""
+        try:
+            title_input = self.page.locator("#storyboard-selector-title")
+            if await title_input.count() > 0:
+                return await title_input.is_enabled()
+            return False
+        except Exception:
+            return False
 
     async def _upload_file_with_retry(self, image_path: Path) -> None:
         for attempt in range(2):
@@ -447,12 +462,36 @@ class PinterestFlow:
             raise RuntimeError("Refusing to upload while on a Pin detail page")
         file_input = self.page.locator("input[type='file']").first
         await file_input.wait_for(state="attached", timeout=15_000)
+        # Attach the file; if the React handler is not wired yet, also dispatch change.
         await file_input.set_input_files(str(image_path))
+        await file_input.dispatch_event("change")
+        # Verify a file was actually attached.
+        try:
+            file_count = await file_input.evaluate("el => el.files?.length || 0")
+        except Exception:
+            file_count = 0
+        logger.info("Pinterest file input set, files attached=%d", file_count)
+        if file_count == 0:
+            # Fallback: trigger a file chooser via click so Playwright can inject the file.
+            logger.warning("set_input_files did not attach a file; trying file chooser fallback")
+            async with self.page.expect_file_chooser(timeout=8_000) as fc_info:
+                await file_input.click(force=True)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(str(image_path))
 
     async def _fill_title(self, title: str) -> None:
         if len(title) > 100:
             logger.warning("Title truncated from %d to 100 chars", len(title))
             title = title[:100].strip()
+        # Wait for the title input to become enabled (Pinterest enables it after upload)
+        for _ in range(60):
+            try:
+                title_input = self.page.locator("#storyboard-selector-title")
+                if await title_input.count() > 0 and await title_input.is_enabled():
+                    break
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(500)
         selectors = [
             "input[placeholder='Add a title']",
             "input[placeholder*='Add a title' i]",
