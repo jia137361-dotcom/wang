@@ -51,7 +51,7 @@ class VolcClient:
         max_retries: int | None = None,
     ) -> None:
         settings = get_settings()
-        self.api_key = api_key or settings.volc_api_key
+        self.api_key = (api_key if api_key is not None else settings.volc_api_key).strip()
         self.model = model or settings.volc_model
         self.base_url = (base_url or settings.volc_base_url).rstrip("/")
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else settings.volc_timeout_seconds
@@ -191,6 +191,8 @@ class VolcClient:
         )
 
     def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise VolcEngineError("VOLC_API_KEY is not configured")
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

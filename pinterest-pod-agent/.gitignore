@@ -10,4 +10,5 @@ test-results/
 var/uploads/
 var/debug/
 var/adspower/
+.tmp/
 celerybeat-schedule*

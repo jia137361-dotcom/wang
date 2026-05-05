@@ -22,6 +22,7 @@ class PublishJobCreate(BaseModel):
     description_hash: str | None = Field(default=None, max_length=64)
     content_batch_id: str | None = Field(default=None, max_length=64)
     variant_angle: str | None = Field(default=None, max_length=160)
+    tagged_topics: str | None = None
 
 
 class ContentGenerateRequest(BaseModel):
@@ -72,6 +73,7 @@ class PublishJobRead(BaseModel):
     description_hash: str | None = None
     content_batch_id: str | None = None
     variant_angle: str | None = None
+    tagged_topics: str | None = None
     created_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None

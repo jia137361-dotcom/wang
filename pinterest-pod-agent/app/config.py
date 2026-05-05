@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     upload_dir: str = Field(default="var/uploads", validation_alias="UPLOAD_DIR")
     max_upload_size_mb: int = Field(default=20, validation_alias="MAX_UPLOAD_SIZE_MB")
     scheduler_enabled: bool = Field(default=True, validation_alias="SCHEDULER_ENABLED")
+    scheduler_auto_dispatch_enabled: bool = Field(
+        default=False,
+        validation_alias="SCHEDULER_AUTO_DISPATCH_ENABLED",
+    )
     scheduler_timezone: str = Field(default="Asia/Shanghai", validation_alias="SCHEDULER_TIMEZONE")
     publish_interval_minutes: int = Field(default=30, validation_alias="PUBLISH_INTERVAL_MINUTES")
     scheduler_dry_run: bool = Field(default=False, validation_alias="SCHEDULER_DRY_RUN")
@@ -62,6 +66,11 @@ class Settings(BaseSettings):
         default="https://api.pinterest.com/v5",
         validation_alias="PINTEREST_TRENDS_BASE_URL",
     )
+    warmup_enable_pin_engagement: bool = Field(
+        default=False,
+        validation_alias="WARMUP_ENABLE_PIN_ENGAGEMENT",
+    )
+    warmup_enable_save: bool = Field(default=False, validation_alias="WARMUP_ENABLE_SAVE")
 
     model_config = SettingsConfigDict(
         env_file=".env",

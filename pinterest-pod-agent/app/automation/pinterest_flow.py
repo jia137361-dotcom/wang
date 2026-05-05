@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Browser, BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from app.automation.ui_decision_agent import UIDecisionAgent, UIDecisionError
 
@@ -170,43 +170,27 @@ class PinterestFlow:
 
         try:
             await self._open_pin_creator()
-            await self._ai_handle_interruptions(
-                stage="after_open_creator",
-                objective="continue creating a Pinterest pin without installing extensions or changing account settings",
-            )
 
-            await self._ai_handle_interruptions(stage="before_upload", objective="upload the Pin image")
             await self._set_file_input(draft.image_path)
             await self.wait_until_uploaded()
-            await self._ai_handle_interruptions(stage="after_upload", objective="continue filling the Pin form")
 
-            await self._ai_handle_interruptions(stage="before_fill_title", objective="fill the Pin title")
             await self._fill_title(draft.title)
-            await self._ai_handle_interruptions(stage="after_fill_title", objective="continue filling the Pin form")
 
             await self._fill_description(draft.description)
-            await self._ai_handle_interruptions(stage="after_fill_description", objective="continue filling the Pin form")
 
             if draft.destination_url:
-                await self._fill_destination_url(draft.destination_url)
-                await self._ai_handle_interruptions(stage="after_fill_link", objective="continue filling the Pin form")
+                logger.info("Destination link fill is disabled; skipping URL=%s", draft.destination_url)
 
-            # TODO: re-enable board selection after tagged topics fix is verified
-            # await self._ai_handle_interruptions(stage="before_select_board", objective="select a Pinterest board")
-            # await self._select_board(draft.board_name, create_if_missing=draft.create_board_if_missing)
-            # await self._ensure_on_creator("after board selection")
-            logger.info("Board selection skipped for tagged-topics debugging — board=%s", draft.board_name)
+            await self._select_board(draft.board_name, create_if_missing=draft.create_board_if_missing)
+            await self._ensure_on_creator("after board selection")
 
             if draft.alt_text:
                 await self._fill_alt_text(draft.alt_text)
 
-            # Tagged topics skipped — user fills manually
-            # if draft.tagged_topics:
-            #     await self._fill_tagged_topics(draft.tagged_topics)
+            if draft.tagged_topics:
+                logger.info("Tagged topics fill is disabled; skipping topics=%s", draft.tagged_topics)
 
-            # Go straight to publish — skip AI interruptions here because the
-            # agent sometimes clicks draft pins in the sidebar instead of the
-            # publish button.
+            await self._validate_current_draft(draft)
             await self._click_publish_button()
             pin_url = await self.wait_until_published()
             return PublishResult(success=True, pin_url=pin_url, message="Pin published")
@@ -339,14 +323,15 @@ class PinterestFlow:
             return True
         risky_overlay_text = " ".join(control.searchable_text for control in controls)
         return any(
-            marker in risky_overlay_text
+            marker in risky_overlay_text.lower()
             for marker in [
                 "install now",
                 "allow notifications",
-                "try it",
-                "not now",
-                "maybe later",
-                "continue",
+                "enable notifications",
+                "turn on notifications",
+                "add to home screen",
+                "try the app",
+                "get the app",
             ]
         )
 
@@ -505,7 +490,7 @@ class PinterestFlow:
         ]:
             try:
                 loc = self.page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
+                if await loc.count() > 0 and await loc.is_visible() and await self._is_safe_creator_locator(loc):
                     await loc.click()
                     toggle_clicked = True
                     await self.page.wait_for_timeout(1200)
@@ -518,17 +503,18 @@ class PinterestFlow:
             await self.page.wait_for_timeout(500)
 
         topic_input_selectors = [
+            "input[placeholder*='tag' i]",
             "input[placeholder*='topic' i]",
             "input[aria-label*='topic' i]",
+            "input[aria-label*='tag' i]",
             "input[placeholder*='interest' i]",
             "input[aria-label*='interest' i]",
-            "input[placeholder*='Search' i]",
             "[data-test-id='topic-search'] input",
             "[data-test-id='tag-input'] input",
             "[data-test-id='tag-search'] input",
             "[role='combobox'][aria-label*='topic' i]",
+            "[role='combobox'][aria-label*='tag' i]",
             "[role='combobox'][aria-label*='interest' i]",
-            "[role='combobox']",
         ]
 
         for topic in topics:
@@ -537,13 +523,22 @@ class PinterestFlow:
                 break
 
             # Strategy A: search-type input (type + Enter to select from dropdown)
+            # Only target inputs inside the creator form to avoid the global
+            # search bar in Pinterest's top navigation.
             try:
-                await self._fill_first_available(topic_input_selectors, topic, timeout_ms=4000)
+                input_loc = await self._find_scoped_input(topic_input_selectors)
+                if input_loc is None:
+                    raise RuntimeError("topic input not found in creator form")
+                await input_loc.fill(topic)
                 await self.page.wait_for_timeout(1000)
                 await self.page.keyboard.press("Enter")
                 await self.page.wait_for_timeout(800)
-                # Clear for next topic
-                await self._clear_first_available(topic_input_selectors)
+                if "/pin-creation-tool/" not in self.page.url and "/pin-builder/" not in self.page.url:
+                    logger.warning("Navigated away after Enter on topic input — attempting go_back")
+                    await self.page.go_back()
+                    await self.page.wait_for_timeout(1500)
+                    continue
+                await input_loc.clear()
                 logger.info("Tagged topic added via input: %s", topic)
                 continue
             except Exception:
@@ -587,8 +582,6 @@ class PinterestFlow:
                 continue
 
     async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
-        # Click the board selector — restrict to the pin creator form area so we
-        # don't accidentally click draft pins in the sidebar.
         board_trigger_selectors = [
             "[data-test-id='board-dropdown-select-button']",
             "button[data-test-id*='board-selector']",
@@ -598,30 +591,28 @@ class PinterestFlow:
             "button:has-text('Select a board')",
             "div[role='button']:has-text('Select a board')",
         ]
-        # Try each selector; confirm the clicked element is inside the creator form
         clicked = False
         for sel in board_trigger_selectors:
             try:
                 loc = self.page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    # Only click if this element is NOT inside a draft sidebar
-                    if await loc.locator("..closest [data-test-id*='pinDraft']").count() == 0:
-                        await loc.click()
-                        clicked = True
-                        break
+                if await loc.count() > 0 and await loc.is_visible() and await self._is_safe_creator_locator(loc):
+                    await loc.click()
+                    clicked = True
+                    break
             except Exception:
                 continue
 
         if not clicked:
-            # Last resort: try nearest match to the board section label
+            # Last resort: find the board label and click the nearest dropdown
             try:
-                board_label = self.page.locator("text=Board").first
-                if await board_label.is_visible():
-                    board_section = board_label.locator("..closest div")
-                    btn = board_section.locator("button, [role='button']").first
-                    if await btn.is_visible():
-                        await btn.click()
-                        clicked = True
+                board_section = self.page.locator("[data-test-id='board-dropdown-placeholder']").first
+                if (
+                    await board_section.count() > 0
+                    and await board_section.is_visible()
+                    and await self._is_safe_creator_locator(board_section)
+                ):
+                    await board_section.click()
+                    clicked = True
             except Exception:
                 pass
 
@@ -652,6 +643,8 @@ class PinterestFlow:
             locator = self.page.locator(selector).first
             try:
                 await locator.wait_for(state="visible", timeout=3_000)
+                if not await self._is_safe_creator_locator(locator):
+                    continue
                 await locator.click()
                 return True
             except Exception:
@@ -804,32 +797,42 @@ class PinterestFlow:
             "div[role='button']:has-text('Publish')",
             "[data-test-id='publish-button']",
             "[data-test-id='submit-pin']",
-            "button:has-text('Create')",
-            "div[role='button']:has-text('Create')",
-            "button:has-text('Save')",
-            "div[role='button']:has-text('Save')",
-            "button:has-text('Done')",
-            "div[role='button']:has-text('Done')",
         ]
         last_error: Exception | None = None
+        safe_candidates: list[Locator] = []
         for selector in selectors:
-            locator = self.page.locator(selector).first
             try:
-                await locator.wait_for(state="visible", timeout=8_000)
-                # Scroll into view to avoid misclicks on sidebar elements
-                await locator.scroll_into_view_if_needed()
-                await self.page.wait_for_timeout(300)
-                for _ in range(40):
+                locators = self.page.locator(selector)
+                count = await locators.count()
+                for index in range(min(count, 10)):
+                    locator = locators.nth(index)
                     try:
-                        if await locator.is_enabled():
-                            await locator.click()
-                            return
-                    except Exception:
-                        await locator.click()
-                        return
-                    await self.page.wait_for_timeout(250)
+                        if not await locator.is_visible():
+                            continue
+                        if not await self._is_safe_creator_locator(locator):
+                            continue
+                        safe_candidates.append(locator)
+                    except Exception as exc:
+                        last_error = exc
             except Exception as exc:
                 last_error = exc
+        if len(safe_candidates) != 1:
+            raise RuntimeError(
+                f"Publish button match is ambiguous or missing: {len(safe_candidates)} safe candidates"
+            ) from last_error
+
+        locator = safe_candidates[0]
+        await locator.scroll_into_view_if_needed()
+        await self.page.wait_for_timeout(300)
+        for _ in range(40):
+            try:
+                if await locator.is_enabled():
+                    await locator.click()
+                    return
+            except Exception:
+                await locator.click()
+                return
+            await self.page.wait_for_timeout(250)
         raise RuntimeError("Could not click Pinterest publish button") from last_error
 
     async def _extract_created_pin_url(self) -> str | None:
@@ -842,12 +845,31 @@ class PinterestFlow:
             return self.page.url
         return None
 
+    async def _find_scoped_input(self, selectors: list[str]) -> "Locator | None":
+        """Return the first input matching *selectors* that is inside the pin
+        creator form (not in the global nav/sidebar)."""
+        for selector in selectors:
+            try:
+                candidates = self.page.locator(selector)
+                count = await candidates.count()
+                for i in range(min(count, 10)):
+                    loc = candidates.nth(i)
+                    if not await loc.is_visible():
+                        continue
+                    if not await self._is_safe_creator_locator(loc):
+                        continue
+                    return loc
+            except Exception:
+                continue
+        return None
+
     async def _fill_first_available(self, selectors: list[str], value: str, *, timeout_ms: int = 5_000) -> None:
         last_error: Exception | None = None
         for selector in selectors:
-            locator = self.page.locator(selector).first
             try:
-                await locator.wait_for(state="visible", timeout=timeout_ms)
+                locator = await self._find_visible_safe_locator(selector, timeout_ms=timeout_ms)
+                if locator is None:
+                    continue
                 try:
                     await locator.fill(value)
                 except Exception:
@@ -858,6 +880,103 @@ class PinterestFlow:
             except Exception as exc:  # Playwright selector fallback should keep trying.
                 last_error = exc
         raise RuntimeError(f"Could not fill field with selectors: {selectors}") from last_error
+
+    async def _find_visible_safe_locator(self, selector: str, *, timeout_ms: int = 5_000) -> Locator | None:
+        try:
+            await self.page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
+        except Exception:
+            return None
+        candidates = self.page.locator(selector)
+        count = await candidates.count()
+        for index in range(min(count, 20)):
+            locator = candidates.nth(index)
+            try:
+                if await locator.is_visible() and await self._is_safe_creator_locator(locator):
+                    return locator
+            except Exception:
+                continue
+        return None
+
+    async def _is_safe_creator_locator(self, locator: Locator) -> bool:
+        try:
+            return bool(
+                await locator.evaluate(
+                    """el => {
+                        const unsafe = [
+                            'aside',
+                            'nav',
+                            'header',
+                            '[role="navigation"]',
+                            '[data-test-id*="draft" i]',
+                            '[data-test-id*="pinDraft" i]',
+                            '[aria-label*="draft" i]',
+                        ];
+                        if (unsafe.some((selector) => el.closest(selector))) {
+                            return false;
+                        }
+                        let node = el;
+                        let depth = 0;
+                        while (node && node !== document.body && depth < 5) {
+                            const text = (node.innerText || '').toLowerCase();
+                            if (text.includes('pin drafts') || text.includes('select all')) {
+                                return false;
+                            }
+                            node = node.parentElement;
+                            depth += 1;
+                        }
+                        return true;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _validate_current_draft(self, draft: PinDraft) -> None:
+        title_value = await self._read_first_safe_value(
+            [
+                "input[placeholder='Add a title']",
+                "input[placeholder*='Add a title' i]",
+                "[data-test-id='pin-draft-title'] textarea",
+                "[data-test-id='pin-draft-title'] [contenteditable='true']",
+                "[contenteditable='true'][aria-label*='title' i]",
+                "div[role='textbox'][aria-label*='title' i]",
+            ]
+        )
+        description_value = await self._read_first_safe_value(
+            [
+                "textarea[placeholder='Add a detailed description']",
+                "textarea[placeholder*='detailed description' i]",
+                "[data-test-id='pin-draft-description'] textarea",
+                "[data-test-id='pin-draft-description'] [contenteditable='true']",
+                "[contenteditable='true'][aria-label*='description' i]",
+                "div[role='textbox'][aria-label*='description' i]",
+            ]
+        )
+        if title_value is not None and self._normalize_text(title_value) != self._normalize_text(draft.title[:100]):
+            raise RuntimeError("Current Pinterest draft title does not match this job; refusing to publish")
+        if description_value is not None:
+            expected = self._normalize_text(draft.description[: min(len(draft.description), 800)])
+            actual = self._normalize_text(description_value)
+            if expected and not (actual.startswith(expected[:120]) or expected.startswith(actual[:120])):
+                raise RuntimeError("Current Pinterest draft description does not match this job; refusing to publish")
+
+    async def _read_first_safe_value(self, selectors: list[str]) -> str | None:
+        for selector in selectors:
+            locator = await self._find_visible_safe_locator(selector, timeout_ms=1_000)
+            if locator is None:
+                continue
+            try:
+                tag_name = await locator.evaluate("el => el.tagName.toLowerCase()")
+                if tag_name in {"input", "textarea"}:
+                    return await locator.input_value(timeout=1_000)
+                return await locator.inner_text(timeout=1_000)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join(value.split()).strip()
 
     async def _has_file_input(self, *, timeout_ms: int) -> bool:
         deadline = datetime.now(UTC).timestamp() + (timeout_ms / 1000)

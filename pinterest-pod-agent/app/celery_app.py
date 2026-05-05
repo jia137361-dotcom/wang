@@ -53,6 +53,28 @@ class MissingCeleryApp:
 
 settings = get_settings()
 
+
+def _build_beat_schedule() -> dict[str, dict[str, Any]]:
+    if not settings.scheduler_enabled:
+        return {}
+
+    schedule: dict[str, dict[str, Any]] = {
+        "reclaim-stale-tasks": {
+            "task": "app.jobs.reclaim_stale_tasks",
+            "schedule": 600,
+            "kwargs": {"stale_minutes": 45},
+            "options": {"queue": "trend"},
+        },
+    }
+    if settings.scheduler_auto_dispatch_enabled:
+        schedule["dispatch-publish-jobs"] = {
+            "task": "app.jobs.dispatch_publish_jobs",
+            "schedule": settings.publish_interval_minutes * 60,
+            "kwargs": {"dry_run": settings.scheduler_dry_run},
+            "options": {"queue": "publish"},
+        }
+    return schedule
+
 TASK_TIME_LIMITS = {
     "app.jobs.publish_job":              {"soft_time_limit": 600,  "time_limit": 900},
     "app.jobs.generate_image_asset":     {"soft_time_limit": 240,  "time_limit": 300},
@@ -106,22 +128,7 @@ else:
         task_create_missing_queues=True,
         worker_max_tasks_per_child=20,
         worker_prefetch_multiplier=1,
-        beat_schedule={
-            "dispatch-publish-jobs": {
-                "task": "app.jobs.dispatch_publish_jobs",
-                "schedule": settings.publish_interval_minutes * 60,
-                "kwargs": {"dry_run": settings.scheduler_dry_run},
-                "options": {"queue": "publish"},
-            },
-            "reclaim-stale-tasks": {
-                "task": "app.jobs.reclaim_stale_tasks",
-                "schedule": 600,  # every 10 minutes
-                "kwargs": {"stale_minutes": 45},
-                "options": {"queue": "trend"},
-            },
-        }
-        if settings.scheduler_enabled
-        else {},
+        beat_schedule=_build_beat_schedule(),
     )
 
     try:

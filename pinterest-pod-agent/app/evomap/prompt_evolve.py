@@ -202,8 +202,7 @@ Output exactly ONE JSON object (no array, no markdown fences):
 {{
   "title": "Pinterest title, max 95 chars, attention-grabbing, English",
   "description": "SEO description, 350-500 chars, naturally weaving 2-3 high-weight keywords, English",
-  "board": "A short Pinterest board name (1-4 words) matching the niche, English",
-  "tagged_topics": ["3-5 relevant Pinterest interests/topics as strings, e.g. 'Home Decor', 'Poster Art'"]
+  "board": "A short Pinterest board name (1-4 words) matching the niche, English"
 }}
 """.strip()
 
@@ -233,16 +232,10 @@ Output exactly ONE JSON object (no array, no markdown fences):
             data = _json.loads(raw)
         except _json.JSONDecodeError:
             return {}
-        topics = data.get("tagged_topics")
-        if isinstance(topics, list):
-            topics = [str(t).strip() for t in topics if str(t).strip()]
-        else:
-            topics = []
         return {
             "title": str(data.get("title", "")),
             "description": str(data.get("description", "")),
             "board": str(data.get("board", "")).strip() or None,
-            "tagged_topics": topics,
         }
 
     # -- single visual prompt (1 instead of 3) --------------------------------

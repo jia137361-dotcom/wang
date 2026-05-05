@@ -122,7 +122,7 @@ def _check_final_retry_and_writeback(
 
         if task_req is not None:
             retries = task_req.retries
-            max_retries = getattr(task_req, "max_retries", 3)
+            max_retries = getattr(task_req, "max_retries", 0)
             if retries >= max_retries:
                 st.status = "failed"
                 st.finished_at = now
@@ -257,21 +257,18 @@ async def _regenerate_content(
             continue
 
         # accepted — write back
+        board = _clean_generated_board(content.get("board"), context)
+
         job.title = title[:100]
         job.description = description
         job.title_hash = dedup.stable_hash(title)
         job.description_hash = dedup.stable_hash(description)
         job.content_hash = dedup.stable_hash(f"{title}|{description}")
-        # auto-generated metadata
-        if content.get("board"):
-            job.board_name = content["board"]
-        if content.get("tagged_topics"):
-            import json as _json
-            job.tagged_topics = _json.dumps(content["tagged_topics"])
+        job.board_name = board
         db.commit()
         logger.info(
             "Content regenerated job=%s title=%.60s... board=%s hash=%s",
-            job.job_id, title, content.get("board"), job.content_hash,
+            job.job_id, title, board, job.content_hash,
         )
         return
 
@@ -283,6 +280,40 @@ async def _regenerate_content(
         raise FatalError(
             f"Content dedup exhausted and job {job.job_id} has no existing content"
         )
+
+
+def _clean_generated_board(value: Any, context: PromptContext) -> str:
+    board = str(value or "").strip()
+    if not board:
+        board = context.niche or context.product_type or "Pinterest Finds"
+    board = " ".join(board.replace("_", " ").split())
+    words = board.split()
+    if len(words) > 4:
+        board = " ".join(words[:4])
+    return board.title()[:160]
+
+
+def _clean_generated_topics(value: Any, context: PromptContext) -> list[str]:
+    if isinstance(value, list):
+        raw_topics = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw_topics = []
+    if not raw_topics:
+        raw_topics = [
+            context.niche,
+            context.product_type,
+            context.season,
+            "Gift Ideas",
+            "Pinterest Finds",
+        ]
+    cleaned: list[str] = []
+    for topic in raw_topics:
+        topic = " ".join(str(topic).replace("_", " ").split()).title()
+        if topic and topic not in cleaned:
+            cleaned.append(topic[:80])
+        if len(cleaned) >= 5:
+            break
+    return cleaned
 
 
 async def _generate_fresh_image(
@@ -540,10 +571,8 @@ def generate_image_for_publish_job_task(
 @celery_app.task(
     name="app.jobs.publish_job",
     autoretry_for=(RetryableTaskError,),
-    max_retries=3,
+    max_retries=0,
     default_retry_delay=60,
-    retry_backoff=True,
-    retry_backoff_max=600,
 )
 def publish_job_task(
     job_id: str, dry_run: bool = False, content_batch_id: str | None = None, **kwargs: Any
@@ -638,16 +667,12 @@ def publish_job_task(
                 error_type="fatal",
             )
             raise FatalError(str(exc)) from exc
-        # retryable — Celery will retry; only write back on final attempt exhaustion
-        # (detected by comparing current retry count against max_retries)
-        from celery import current_task
-        task_req = current_task.request if current_task else None
-        if task_req is not None and task_req.retries >= getattr(task_req, 'max_retries', 3):
-            _st_writeback(
-                st_id, "failed",
-                error_message=str(exc),
-                error_type=error_type,
-            )
+        # max_retries=0 means we never retry — write back immediately
+        _st_writeback(
+            st_id, "failed",
+            error_message=str(exc),
+            error_type=error_type,
+        )
         raise RetryableTaskError(str(exc)) from exc
 
 
@@ -1029,7 +1054,7 @@ def warmup_task(
 @celery_app.task(
     name="app.jobs.warmup_and_publish",
     autoretry_for=(RetryableTaskError,),
-    max_retries=2,
+    max_retries=0,
     default_retry_delay=300,
 )
 def warmup_and_publish_task(

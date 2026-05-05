@@ -125,6 +125,7 @@ async def run_warmup_then_publish(
         )
 
         # phase 2: publish on the same page
+        await session.page.goto("https://www.pinterest.com/", wait_until="domcontentloaded")
         pinterest = PinterestFlow(session.page)
         tagged_topics = None
         if job.tagged_topics:
