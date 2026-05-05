@@ -114,9 +114,10 @@ async def run_warmup_session(
 ) -> WarmupResult:
     """Run a single warmup session using an already-open AdsPower profile page.
 
-    The session performs: home-feed scrolling → keyword searches with result
-    browsing → random pin interactions (save) → idle cooldown.
-    Caller must open/close the browser profile.
+    Loops until *deadline* (driven by *duration_minutes*), randomly picking
+    one of three actions each round: home-feed scrolling, keyword search +
+    result browsing, or pin interaction.  Caller must open/close the browser
+    profile.
     """
     settings = get_settings()
     if enable_pin_engagement is None:
@@ -127,73 +128,55 @@ async def run_warmup_session(
     human = HumanSimulator()
     started_at = datetime.now(UTC)
     start_ts = time.time()
-    total_seconds = duration_minutes * 60
-    deadline = start_ts + total_seconds
+    deadline = start_ts + duration_minutes * 60
     actions = 0
     searches = 0
     interactions = 0
 
     logger.info("Warmup session start account=%s duration=%dm", account_id, duration_minutes)
 
-    # 1. Navigate to Pinterest home and scroll the feed
+    # 1. Navigate to Pinterest home
     await page.goto("https://www.pinterest.com/", wait_until="domcontentloaded")
     await human.random_delay(1.5, 3.0)
     logger.info("Pinterest home loaded url=%s", page.url)
 
-    await _random_scroll_activity(
-        page,
-        human,
-        count=random.randint(3, 6),
-        enable_pin_engagement=enable_pin_engagement,
-        enable_save=enable_save,
-    )
-    actions += 1
-
-    # 2. Search + browse loop (until time budget is ~60 % consumed)
-    keywords = random.sample(SEARCH_KEYWORDS, min(3, len(SEARCH_KEYWORDS)))
-    for kw in keywords:
-        if time.time() - start_ts > total_seconds * 0.6:
-            break
-        await _search_and_browse(
-            page,
-            human,
-            kw,
-            enable_pin_engagement=enable_pin_engagement,
-            enable_save=enable_save,
-        )
-        searches += 1
-        actions += 1
-
-    # 3. Pin interactions
-    if enable_pin_engagement:
-        interact_count = random.randint(1, 4)
-        for _ in range(interact_count):
-            if time.time() - start_ts > total_seconds * 0.85:
-                break
+    # 2. Time-driven main loop — keep acting until deadline
+    unused_keywords: list[str] = list(SEARCH_KEYWORDS)
+    while time.time() < deadline - 3:  # leave room for final cooldown
+        roll = random.random()
+        if enable_pin_engagement and roll < 0.15:
             ok = await _interact_with_random_pin(page, human, enable_save=enable_save)
+            actions += 1
             if ok:
                 interactions += 1
+        elif roll < 0.65:
+            scrolls = random.randint(2, 5)
+            await _random_scroll_activity(
+                page, human, count=scrolls,
+                enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
+            )
             actions += 1
-            if random.random() < 0.3:
-                await asyncio.sleep(random.randint(2, 8))
+        else:
+            if not unused_keywords:
+                unused_keywords = list(SEARCH_KEYWORDS)
+            kw = random.choice(unused_keywords)
+            unused_keywords.remove(kw)
+            await _search_and_browse(
+                page, human, kw,
+                enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
+            )
+            searches += 1
+            actions += 1
+        await asyncio.sleep(random.uniform(1.0, 3.0))
 
-    # 4. Final idle scrolling
-    await _random_scroll_activity(
-        page,
-        human,
-        count=random.randint(2, 5),
-        enable_pin_engagement=enable_pin_engagement,
-        enable_save=enable_save,
-    )
-    actions += 1
-
-    # 5. Cooldown — stay on page looking idle
+    # 3. Cooldown — wait until the real deadline
     remaining = deadline - time.time()
-    if remaining > 10:
-        await asyncio.sleep(min(remaining, random.randint(10, 30)))
+    if remaining > 0:
+        logger.info("Warmup cooldown %.1fs", remaining)
+        await asyncio.sleep(remaining)
     await _return_to_pinterest_home(page)
 
-    elapsed = time.time() - (started_at.timestamp())
+    elapsed = time.time() - started_at.timestamp()
     finished_at = datetime.now(UTC)
     logger.info(
         "Warmup session done account=%s elapsed=%ds actions=%d searches=%d interactions=%d",

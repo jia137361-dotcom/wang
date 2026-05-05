@@ -145,26 +145,29 @@ async def run_warmup_then_publish(
         )
         publish_result = await pinterest.publish_pin(draft)
 
-        # record to PinPerformance via EvoMap
+        # record to PinPerformance via EvoMap (non-fatal — don't fail the task)
         pin_perf_id: int | None = None
-        with get_sessionmaker()() as db:
-            from app.evomap.prompt_evolve import PromptEvolver
+        try:
+            with get_sessionmaker()() as db:
+                from app.evomap.prompt_evolve import PromptEvolver
 
-            evolver = PromptEvolver(db=db)
-            content_prompt = evolver.build_content_prompt(publish_input.prompt_context)
-            record = _record_publish(
-                db=db,
-                evolver=evolver,
-                workflow_input=publish_input,
-                result=publish_result,
-                content_prompt=content_prompt,
-                content_batch_id=content_batch_id,
-                variant_angle=variant_angle,
-                content_hash=content_hash,
-                title_hash=title_hash,
-                description_hash=description_hash,
-            )
-            pin_perf_id = record.id
+                evolver = PromptEvolver(db=db)
+                content_prompt = evolver.build_content_prompt(publish_input.prompt_context)
+                record = _record_publish(
+                    db=db,
+                    evolver=evolver,
+                    workflow_input=publish_input,
+                    result=publish_result,
+                    content_prompt=content_prompt,
+                    content_batch_id=content_batch_id,
+                    variant_angle=variant_angle,
+                    content_hash=content_hash,
+                    title_hash=title_hash,
+                    description_hash=description_hash,
+                )
+                pin_perf_id = record.id
+        except Exception:
+            logger.exception("PinPerformance recording failed — publish is still successful")
 
         return WarmupPublishResult(
             warmup=warmup_result,

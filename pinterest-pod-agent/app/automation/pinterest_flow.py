@@ -907,8 +907,6 @@ class PinterestFlow:
                             'nav',
                             'header',
                             '[role="navigation"]',
-                            '[data-test-id*="draft" i]',
-                            '[data-test-id*="pinDraft" i]',
                             '[aria-label*="draft" i]',
                         ];
                         if (unsafe.some((selector) => el.closest(selector))) {
