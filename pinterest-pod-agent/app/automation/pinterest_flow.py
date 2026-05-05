@@ -29,6 +29,7 @@ class PinDraft:
     image_path: Path
     destination_url: str | None = None
     alt_text: str | None = None
+    tagged_topics: list[str] | None = None
     create_board_if_missing: bool = True
 
 
@@ -190,14 +191,22 @@ class PinterestFlow:
                 await self._fill_destination_url(draft.destination_url)
                 await self._ai_handle_interruptions(stage="after_fill_link", objective="continue filling the Pin form")
 
-            await self._ai_handle_interruptions(stage="before_select_board", objective="select a Pinterest board")
-            await self._select_board(draft.board_name, create_if_missing=draft.create_board_if_missing)
-            await self._ai_handle_interruptions(stage="after_select_board", objective="prepare to publish the Pin")
+            # TODO: re-enable board selection after tagged topics fix is verified
+            # await self._ai_handle_interruptions(stage="before_select_board", objective="select a Pinterest board")
+            # await self._select_board(draft.board_name, create_if_missing=draft.create_board_if_missing)
+            # await self._ensure_on_creator("after board selection")
+            logger.info("Board selection skipped for tagged-topics debugging — board=%s", draft.board_name)
 
             if draft.alt_text:
                 await self._fill_alt_text(draft.alt_text)
 
-            await self._ai_handle_interruptions(stage="before_publish", objective="publish the completed Pinterest Pin")
+            # Tagged topics skipped — user fills manually
+            # if draft.tagged_topics:
+            #     await self._fill_tagged_topics(draft.tagged_topics)
+
+            # Go straight to publish — skip AI interruptions here because the
+            # agent sometimes clicks draft pins in the sidebar instead of the
+            # publish button.
             await self._click_publish_button()
             pin_url = await self.wait_until_published()
             return PublishResult(success=True, pin_url=pin_url, message="Pin published")
@@ -399,6 +408,9 @@ class PinterestFlow:
         await file_input.set_input_files(str(image_path))
 
     async def _fill_title(self, title: str) -> None:
+        if len(title) > 100:
+            logger.warning("Title truncated from %d to 100 chars", len(title))
+            title = title[:100].strip()
         selectors = [
             "input[placeholder='Add a title']",
             "input[placeholder*='Add a title' i]",
@@ -413,6 +425,18 @@ class PinterestFlow:
         await self._fill_first_available(selectors, title)
 
     async def _fill_description(self, description: str) -> None:
+        if len(description) > 800:
+            # Try to truncate at the last sentence boundary within limit
+            truncated = description[:800]
+            for end_char in ('. ', '! ', '? ', '.\n', '!\n', '?\n', '.', '!', '?'):
+                last = truncated.rfind(end_char)
+                if last > 600:
+                    truncated = truncated[:last + len(end_char.rstrip())]
+                    break
+            else:
+                truncated = truncated.rstrip()
+            logger.warning("Description truncated from %d to %d chars", len(description), len(truncated))
+            description = truncated
         selectors = [
             "textarea[placeholder='Add a detailed description']",
             "textarea[placeholder*='detailed description' i]",
@@ -436,6 +460,18 @@ class PinterestFlow:
         ]
         await self._fill_first_available(selectors, destination_url)
 
+    async def _ensure_on_creator(self, context: str = "") -> None:
+        """Verify we are still on the pin creator; if not, navigate back to it."""
+        if "/pin-creation-tool/" in self.page.url or "/pin-builder/" in self.page.url:
+            return
+        logger.warning("Left pin creator (%s) — url=%s, attempting recovery via go_back", context, self.page.url)
+        await self.page.go_back()
+        await self.page.wait_for_timeout(1500)
+        if "/pin-creation-tool/" not in self.page.url and "/pin-builder/" not in self.page.url:
+            raise RuntimeError(
+                f"Left pin creator during {context} and could not recover (url={self.page.url})"
+            )
+
     async def _fill_alt_text(self, alt_text: str) -> None:
         alt_button = self.page.get_by_role("button", name="Add alt text")
         if await alt_button.count():
@@ -445,17 +481,156 @@ class PinterestFlow:
                 alt_text,
             )
 
-    async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
-        await self._click_first_available(
-            [
-                "div[role='button']:has-text('Choose a board')",
-                "button:has-text('Choose a board')",
-                "text=Choose a board",
-                "[data-test-id='board-dropdown-select-button']",
-                "button:has-text('Select a board')",
-                "div[role='button']:has-text('Select a board')",
+    async def _fill_tagged_topics(self, topics: list[str]) -> None:
+        """Fill tagged topics / interests on the Pin form.
+
+        Pinterest may label the feature 'Topics', 'Tagged topics', or 'Interests'.
+        If the toggle button cannot be found, the step is skipped rather than
+        failing the entire publish.
+        """
+        # Try to click the toggle / expander for the topics section
+        toggle_clicked = False
+        for sel in [
+            "button:has-text('Add topics')",
+            "div[role='button']:has-text('Add topics')",
+            "button:has-text('Topics')",
+            "div[role='button']:has-text('Topics')",
+            "[data-test-id='tag-selector'] button",
+            "[data-test-id='tag-input-toggle']",
+            "button:has-text('Tagged topics')",
+            "div:has-text('Tagged topics')",
+            "button:has-text('Interests')",
+            "div:has-text('Interests')",
+            "text=Topics",
+        ]:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click()
+                    toggle_clicked = True
+                    await self.page.wait_for_timeout(1200)
+                    break
+            except Exception:
+                continue
+
+        if not toggle_clicked:
+            logger.info("Tagged topics toggle not found — topics UI may already be visible, continuing")
+            await self.page.wait_for_timeout(500)
+
+        topic_input_selectors = [
+            "input[placeholder*='topic' i]",
+            "input[aria-label*='topic' i]",
+            "input[placeholder*='interest' i]",
+            "input[aria-label*='interest' i]",
+            "input[placeholder*='Search' i]",
+            "[data-test-id='topic-search'] input",
+            "[data-test-id='tag-input'] input",
+            "[data-test-id='tag-search'] input",
+            "[role='combobox'][aria-label*='topic' i]",
+            "[role='combobox'][aria-label*='interest' i]",
+            "[role='combobox']",
+        ]
+
+        for topic in topics:
+            if "/pin-creation-tool/" not in self.page.url and "/pin-builder/" not in self.page.url:
+                logger.error("Navigated away from pin creator during tagged topics fill")
+                break
+
+            # Strategy A: search-type input (type + Enter to select from dropdown)
+            try:
+                await self._fill_first_available(topic_input_selectors, topic, timeout_ms=4000)
+                await self.page.wait_for_timeout(1000)
+                await self.page.keyboard.press("Enter")
+                await self.page.wait_for_timeout(800)
+                # Clear for next topic
+                await self._clear_first_available(topic_input_selectors)
+                logger.info("Tagged topic added via input: %s", topic)
+                continue
+            except Exception:
+                pass
+
+            # Strategy B: chip/button selection — click a suggested topic
+            chip_selectors = [
+                f"[role='option']:has-text('{topic}')",
+                f"button:has-text('{topic}')",
+                f"div[role='button']:has-text('{topic}')",
+                f"span:has-text('{topic}'):near(:has-text('topic'))",
             ]
-        )
+            selected = False
+            for csel in chip_selectors:
+                try:
+                    chip = self.page.locator(csel).first
+                    if await chip.count() > 0 and await chip.is_visible():
+                        await chip.click()
+                        await self.page.wait_for_timeout(800)
+                        selected = True
+                        logger.info("Tagged topic added via chip: %s", topic)
+                        break
+                except Exception:
+                    continue
+
+            if not selected:
+                logger.warning(
+                    "Could not fill tagged topic=%s — input and chip selectors both failed, continuing",
+                    topic,
+                )
+
+    async def _clear_first_available(self, selectors: list[str]) -> None:
+        """Clear the first matching input field."""
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if await locator.count() > 0:
+                    await locator.clear()
+                    return
+            except Exception:
+                continue
+
+    async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
+        # Click the board selector — restrict to the pin creator form area so we
+        # don't accidentally click draft pins in the sidebar.
+        board_trigger_selectors = [
+            "[data-test-id='board-dropdown-select-button']",
+            "button[data-test-id*='board-selector']",
+            "[data-test-id*='board-select'] button",
+            "div[role='button']:has-text('Choose a board')",
+            "button:has-text('Choose a board')",
+            "button:has-text('Select a board')",
+            "div[role='button']:has-text('Select a board')",
+        ]
+        # Try each selector; confirm the clicked element is inside the creator form
+        clicked = False
+        for sel in board_trigger_selectors:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    # Only click if this element is NOT inside a draft sidebar
+                    if await loc.locator("..closest [data-test-id*='pinDraft']").count() == 0:
+                        await loc.click()
+                        clicked = True
+                        break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Last resort: try nearest match to the board section label
+            try:
+                board_label = self.page.locator("text=Board").first
+                if await board_label.is_visible():
+                    board_section = board_label.locator("..closest div")
+                    btn = board_section.locator("button, [role='button']").first
+                    if await btn.is_visible():
+                        await btn.click()
+                        clicked = True
+            except Exception:
+                pass
+
+        if not clicked:
+            logger.info("Board dropdown trigger not found — board may already be set, continuing")
+            return
+
+        # Wait for dropdown to render
+        await self.page.wait_for_timeout(1500)
         if await self._click_board_option(board_name):
             return
         if not create_if_missing:
@@ -464,12 +639,14 @@ class PinterestFlow:
         await self._wait_for_dialog_closed()
 
     async def _click_board_option(self, board_name: str) -> bool:
+        # Only match within board dropdown/menu, not sidebar drafts
         selectors = [
+            f"[role='listbox'] [role='option']:has-text('{board_name}')",
+            f"[role='menu'] [role='menuitem']:has-text('{board_name}')",
             f"[role='option']:has-text('{board_name}')",
             f"[role='menuitem']:has-text('{board_name}')",
-            f"[data-test-id*='board']:has-text('{board_name}')",
-            f"div[role='button']:has-text('{board_name}')",
-            f"text={board_name}",
+            f"[data-test-id*='board-row']:has-text('{board_name}')",
+            f"li:has-text('{board_name}')",
         ]
         for selector in selectors:
             locator = self.page.locator(selector).first
@@ -618,17 +795,30 @@ class PinterestFlow:
         return False
 
     async def _click_publish_button(self) -> None:
+        # Ensure we are still on the pin creator before attempting publish
+        if "/pin-creation-tool/" not in self.page.url and "/pin-builder/" not in self.page.url:
+            raise RuntimeError(f"Cannot click publish — left pin creator (url={self.page.url})")
+
         selectors = [
             "button:has-text('Publish')",
             "div[role='button']:has-text('Publish')",
+            "[data-test-id='publish-button']",
+            "[data-test-id='submit-pin']",
+            "button:has-text('Create')",
+            "div[role='button']:has-text('Create')",
             "button:has-text('Save')",
             "div[role='button']:has-text('Save')",
+            "button:has-text('Done')",
+            "div[role='button']:has-text('Done')",
         ]
         last_error: Exception | None = None
         for selector in selectors:
             locator = self.page.locator(selector).first
             try:
-                await locator.wait_for(state="visible", timeout=15_000)
+                await locator.wait_for(state="visible", timeout=8_000)
+                # Scroll into view to avoid misclicks on sidebar elements
+                await locator.scroll_into_view_if_needed()
+                await self.page.wait_for_timeout(300)
                 for _ in range(40):
                     try:
                         if await locator.is_enabled():
@@ -652,12 +842,12 @@ class PinterestFlow:
             return self.page.url
         return None
 
-    async def _fill_first_available(self, selectors: list[str], value: str) -> None:
+    async def _fill_first_available(self, selectors: list[str], value: str, *, timeout_ms: int = 5_000) -> None:
         last_error: Exception | None = None
         for selector in selectors:
             locator = self.page.locator(selector).first
             try:
-                await locator.wait_for(state="visible", timeout=5_000)
+                await locator.wait_for(state="visible", timeout=timeout_ms)
                 try:
                     await locator.fill(value)
                 except Exception:

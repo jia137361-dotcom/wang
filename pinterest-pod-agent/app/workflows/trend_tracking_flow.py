@@ -71,7 +71,15 @@ def _store_trend_signals(
         if signal.keyword.strip()
     ]
     strategy[bucket] = normalized
-    strategy["trend_keywords"] = sorted({item["keyword"] for item in normalized})
+    # Merge keywords from ALL buckets so one refresh doesn't wipe another
+    all_keywords: set[str] = set()
+    for bucket_key in ("current_event_trends", "product_trends"):
+        bucket_data = strategy.get(bucket_key, [])
+        if isinstance(bucket_data, list):
+            for item in bucket_data:
+                if isinstance(item, dict) and "keyword" in item:
+                    all_keywords.add(item["keyword"])
+    strategy["trend_keywords"] = sorted(all_keywords)
 
     history = strategy.get("trend_history", [])
     history.append(
@@ -84,13 +92,16 @@ def _store_trend_signals(
         }
     )
     strategy["trend_history"] = history[-50:]
-    strategy["trend_source_status"] = {
+    source_status = strategy.get("trend_source_status", {})
+    if not isinstance(source_status, dict):
+        source_status = {}
+    source_status[source_type] = {
         "bucket": bucket,
-        "source": source_type,
         "provider": fetch_result.provider if fetch_result else "manual",
         "status": fetch_result.status if fetch_result else "ok",
         "metadata": fetch_result.metadata if fetch_result else {},
         "recorded_at": datetime.now(UTC).isoformat(),
     }
+    strategy["trend_source_status"] = source_status
     upsert_strategy(db, scope, strategy, version=strategy.get("version", source_type))
     return strategy

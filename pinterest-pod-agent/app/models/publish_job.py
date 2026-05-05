@@ -33,6 +33,7 @@ class PublishJob(Base):
     description_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     content_batch_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     variant_angle: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    tagged_topics: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

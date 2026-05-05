@@ -47,6 +47,7 @@ async def run_warmup_then_publish(
     The same ``Page`` is shared so Pinterest sees one continuous session.
     """
     from app.database import get_sessionmaker
+    from app.models.account_policy import AccountPolicy
     from app.safety.proxy_check import verify_us_ip
 
     # resolve account & job
@@ -63,14 +64,32 @@ async def run_warmup_then_publish(
         job = db.scalar(select(PublishJob).where(PublishJob.job_id == job_id))
         if job is None:
             raise ValueError(f"PublishJob not found: {job_id}")
+
+        # Read warmup duration from AccountPolicy if available
+        policy = db.scalar(
+            select(AccountPolicy).where(AccountPolicy.account_id == account_id)
+        )
+        if policy and policy.warmup_duration_min:
+            warmup_duration_minutes = policy.warmup_duration_min
+
+        # Truncate title and description to Pinterest limits before creating PinDraft
+        truncated_title = job.title.strip()
+        if len(truncated_title) > 100:
+            logger.warning("Title truncated %d → 100 chars for job=%s", len(truncated_title), job_id)
+            truncated_title = truncated_title[:100].strip()
+        truncated_description = (job.description or "").strip()
+        if len(truncated_description) > 800:
+            logger.warning("Description truncated %d → 800 chars for job=%s", len(truncated_description), job_id)
+            truncated_description = truncated_description[:800].strip()
+
         # Build workflow input while we have the DB session
         publish_input = AccountPublishWorkflowInput(
             account_id=job.account_id,
             campaign_id=job.campaign_id,
             board_name=job.board_name,
             image_path=Path(job.image_path),
-            title=job.title,
-            description=job.description,
+            title=truncated_title,
+            description=truncated_description,
             destination_url=job.destination_url,
             visual_prompt=None,
             prompt_context=PromptContext(
@@ -107,12 +126,21 @@ async def run_warmup_then_publish(
 
         # phase 2: publish on the same page
         pinterest = PinterestFlow(session.page)
+        tagged_topics = None
+        if job.tagged_topics:
+            import json as _json
+            try:
+                tagged_topics = _json.loads(job.tagged_topics)
+            except Exception:
+                pass
+
         draft = PinDraft(
-            title=job.title,
-            description=job.description,
+            title=truncated_title,
+            description=truncated_description,
             board_name=job.board_name,
             image_path=Path(job.image_path),
             destination_url=job.destination_url or None,
+            tagged_topics=tagged_topics,
         )
         publish_result = await pinterest.publish_pin(draft)
 

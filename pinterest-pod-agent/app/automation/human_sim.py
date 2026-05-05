@@ -110,6 +110,21 @@ class HumanSimulator:
             except Exception:
                 pass
 
+    async def click_random_element(self, page: Page, selector: str) -> bool:
+        """Click a randomly chosen visible element matching *selector*.
+        Returns True if a click was performed."""
+        try:
+            elements = page.locator(selector)
+            count = await elements.count()
+            if count:
+                idx = random.randint(0, count - 1)
+                element = elements.nth(idx)
+                await self.click_element_with_movement(page, element)
+                return True
+        except Exception:
+            pass
+        return False
+
     async def simulate_typing(
         self,
         page: Page,

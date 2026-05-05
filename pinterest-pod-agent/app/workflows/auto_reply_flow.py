@@ -143,8 +143,18 @@ async def run_auto_reply_flow(
 
 
 def classify_comment_safety(text: str) -> tuple[str, str | None]:
+    """Classify comment safety.
+
+    Single-word English markers use ``\\b`` boundaries to avoid matching
+    substrings (e.g. "price" should not flag "priceless").  Multi-word
+    phrases and Chinese characters use plain substring matching.
+    """
+    import re
+
     normalized = text.lower()
-    manual_review_markers = {
+
+    # Single-word markers with word-boundary matching
+    word_markers = {
         "refund": "refund_or_order_issue",
         "return": "refund_or_order_issue",
         "chargeback": "refund_or_order_issue",
@@ -156,9 +166,23 @@ def classify_comment_safety(text: str) -> tuple[str, str | None]:
         "lawsuit": "legal",
         "sue": "legal",
         "price": "pricing_dispute",
+        "password": "account_security",
+    }
+    for word, reason in word_markers.items():
+        if re.search(rf"\b{re.escape(word)}\b", normalized):
+            return "manual_review", reason
+
+    # Multi-word phrases — low false-positive risk with plain substring
+    phrase_markers = {
         "too expensive": "pricing_dispute",
         "account hacked": "account_security",
-        "password": "account_security",
+    }
+    for phrase, reason in phrase_markers.items():
+        if phrase in normalized:
+            return "manual_review", reason
+
+    # Chinese character markers
+    cn_markers = {
         "退款": "refund_or_order_issue",
         "退货": "refund_or_order_issue",
         "投诉": "complaint",
@@ -168,9 +192,10 @@ def classify_comment_safety(text: str) -> tuple[str, str | None]:
         "太贵": "pricing_dispute",
         "账号": "account_security",
     }
-    for marker, reason in manual_review_markers.items():
+    for marker, reason in cn_markers.items():
         if marker in normalized:
             return "manual_review", reason
+
     return "safe", None
 
 

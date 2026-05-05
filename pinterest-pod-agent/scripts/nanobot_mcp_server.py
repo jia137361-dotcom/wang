@@ -59,7 +59,7 @@ def create_publish_task(
     warmup_duration_minutes: int = 5,
     scheduled_at: str | None = None,
     priority: int = 5,
-    dry_run: bool = True,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Create a warmup_and_publish scheduled_task for a specific account + job.
 
@@ -133,7 +133,7 @@ def create_publish_task(
 @mcp.tool()
 def dispatch_ready_tasks(
     limit: int = 20,
-    dry_run: bool = True,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Manually trigger the task dispatcher NOW (bypasses Beat schedule).
 
@@ -331,7 +331,7 @@ def publish_pin_direct(
     account_id: str,
     job_id: str,
 ) -> dict[str, Any]:
-    """Publish a Pin immediately via warmup_and_publish (dry-run only).
+    """Publish a Pin immediately via warmup_and_publish (dry-run only for safety).
 
     This tool always runs in dry_run mode — no real Pinterest publishing.
     Use create_publish_task + dispatch_ready_tasks for production.
@@ -387,7 +387,7 @@ def publish_pin_direct(
 @mcp.tool()
 def auto_schedule_daily(
     account_ids: list[str] | None = None,
-    dry_run: bool = True,
+    dry_run: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
     """Generate today's task schedule: warmup_and_publish for each account.

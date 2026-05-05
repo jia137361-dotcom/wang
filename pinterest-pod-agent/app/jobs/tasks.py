@@ -162,8 +162,22 @@ async def _regenerate_content(
     """Regenerate title + description via EvoMap, with dedup against history.
 
     Overwrites job.title, job.description, job.*_hash in-place and commits.
-    Raises RetryableTaskError on LLM failure so Celery retries.
+    Falls back to existing content when LLM is unavailable.
     """
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.volc_api_key:
+        if job.title and job.description:
+            logger.info(
+                "VOLC_API_KEY not configured — keeping existing content for job=%s",
+                job.job_id,
+            )
+            return
+        raise FatalError(
+            f"No VOLC_API_KEY configured and job {job.job_id} has no existing content"
+        )
+
     from app.evomap.content_dedup import ContentDeduper
     from app.evomap.prompt_evolve import PromptEvolver
     from app.models.pin_performance import PinPerformance
@@ -188,8 +202,14 @@ async def _regenerate_content(
             content = await evolver.agenerate_single_content(context)
         except Exception as exc:
             if attempt == 1:
-                raise RetryableTaskError(
-                    f"LLM content generation failed after retry: {exc}"
+                logger.warning(
+                    "LLM content generation failed for job=%s, falling back to existing: %s",
+                    job.job_id, exc,
+                )
+                if job.title and job.description:
+                    return
+                raise FatalError(
+                    f"LLM content generation failed and job {job.job_id} has no existing content"
                 ) from exc
             continue
 
@@ -197,8 +217,14 @@ async def _regenerate_content(
         description = content.get("description", "")
         if not title or not description:
             if attempt == 1:
-                raise RetryableTaskError(
-                    "LLM returned empty title or description after retry"
+                logger.warning(
+                    "LLM returned empty content for job=%s, falling back to existing",
+                    job.job_id,
+                )
+                if job.title and job.description:
+                    return
+                raise FatalError(
+                    f"LLM returned empty content and job {job.job_id} has no existing content"
                 )
             continue
 
@@ -231,32 +257,62 @@ async def _regenerate_content(
             continue
 
         # accepted — write back
-        job.title = title
+        job.title = title[:100]
         job.description = description
         job.title_hash = dedup.stable_hash(title)
         job.description_hash = dedup.stable_hash(description)
         job.content_hash = dedup.stable_hash(f"{title}|{description}")
+        # auto-generated metadata
+        if content.get("board"):
+            job.board_name = content["board"]
+        if content.get("tagged_topics"):
+            import json as _json
+            job.tagged_topics = _json.dumps(content["tagged_topics"])
         db.commit()
         logger.info(
-            "Content regenerated job=%s title=%.60s... hash=%s",
-            job.job_id, title, job.content_hash,
+            "Content regenerated job=%s title=%.60s... board=%s hash=%s",
+            job.job_id, title, content.get("board"), job.content_hash,
         )
         return
 
-    raise RetryableTaskError(
-        f"Content dedup failed after all retries for job {job.job_id}"
+    logger.warning(
+        "Content dedup failed after all retries for job=%s, keeping existing",
+        job.job_id,
     )
+    if not job.title or not job.description:
+        raise FatalError(
+            f"Content dedup exhausted and job {job.job_id} has no existing content"
+        )
 
 
 async def _generate_fresh_image(
     job: PublishJob,
     db: Any,
 ) -> None:
-    """Generate a fresh image via EvoMap visual prompt → Flux 2 Pro → ESRGAN.
+    """Generate a fresh image via EvoMap → Flux 2 Pro → ESRGAN; falls back to existing.
 
-    Overwrites job.image_path in-place and commits.
-    Raises RetryableTaskError on failure so Celery retries.
+    When LLM or image service is unavailable, keeps the job's existing image.
+    Only raises when the job has no image at all.
     """
+    from pathlib import Path
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    has_fal = bool(settings.fal_key)
+    has_llm = bool(settings.volc_api_key)
+
+    if not has_fal:
+        if job.image_path and Path(job.image_path).exists():
+            logger.info(
+                "FAL_KEY not configured — keeping existing image for job=%s",
+                job.job_id,
+            )
+            return
+        raise FatalError(
+            f"FAL_KEY not configured and job {job.job_id} has no existing image"
+        )
+
     from app.evomap.prompt_evolve import PromptEvolver
     from app.workflows.image_generation_flow import DEFAULT_PIN_IMAGE_SIZE, generate_image_asset
 
@@ -269,12 +325,25 @@ async def _generate_fresh_image(
         destination_url=job.destination_url,
     )
 
-    evolver = PromptEvolver(db=db)
-    visual_prompt = await evolver.agenerate_visual_brief(context)
+    visual_prompt = None
+    if has_llm:
+        evolver = PromptEvolver(db=db)
+        try:
+            visual_prompt = await evolver.agenerate_visual_brief(context)
+        except Exception as exc:
+            logger.warning(
+                "Visual prompt generation failed for job=%s: %s", job.job_id, exc,
+            )
 
     if not visual_prompt or len(visual_prompt.strip()) < 10:
-        raise RetryableTaskError(
-            f"LLM returned empty/too-short visual prompt for job {job.job_id}"
+        if job.image_path and Path(job.image_path).exists():
+            logger.info(
+                "No visual prompt generated — keeping existing image for job=%s",
+                job.job_id,
+            )
+            return
+        raise FatalError(
+            f"No visual prompt for job {job.job_id} and no existing image"
         )
 
     logger.info(
@@ -289,8 +358,14 @@ async def _generate_fresh_image(
             image_size=DEFAULT_PIN_IMAGE_SIZE,
         )
     except Exception as exc:
-        raise RetryableTaskError(
-            f"Image auto-generation failed for job {job.job_id}: {exc}"
+        if job.image_path and Path(job.image_path).exists():
+            logger.warning(
+                "Image generation failed for job=%s, keeping existing: %s",
+                job.job_id, exc,
+            )
+            return
+        raise FatalError(
+            f"Image generation failed for job {job.job_id} and no existing image: {exc}"
         ) from exc
 
     job.image_path = asset.local_path
@@ -484,23 +559,17 @@ def publish_job_task(
             )
             raise FatalError(f"Publish job is cancelled: {job_id}")
 
-        # auto-regenerate content + image before publish (every post is fresh)
+        # auto-regenerate content + image before publish (falls back to existing)
         try:
             run_async(_regenerate_content(job, job.account_id, db))
             run_async(_generate_fresh_image(job, db))
-        except RetryableTaskError:
+        except FatalError:
             raise
         except Exception as exc:
-            job.status = "failed"
-            job.error_message = f"Content/image regeneration failed: {exc}"
-            job.finished_at = datetime.now(UTC)
-            db.commit()
-            _st_writeback(
-                st_id, "failed",
-                error_message=job.error_message,
-                error_type="fatal",
+            logger.warning(
+                "Content/image regeneration warning for job=%s: %s — proceeding",
+                job.job_id, exc,
             )
-            raise FatalError(job.error_message) from exc
 
         batch_id = content_batch_id or job.content_batch_id or f"batch_{job_id[:12]}"
         job.content_batch_id = batch_id
@@ -583,7 +652,7 @@ def publish_job_task(
 
 
 @celery_app.task(name="app.jobs.dispatch_publish_jobs")
-def dispatch_publish_jobs_task(limit: int = 20, dry_run: bool = True) -> dict[str, Any]:
+def dispatch_publish_jobs_task(limit: int = 20, dry_run: bool = False) -> dict[str, Any]:
     """Scan scheduled_task (+ legacy publish_job) and enqueue Celery tasks.
 
     dry_run is on by default to prevent accidental real-platform publishing
@@ -966,7 +1035,7 @@ def warmup_task(
 def warmup_and_publish_task(
     account_id: str,
     job_id: str,
-    warmup_duration_minutes: int = 5,
+    warmup_duration_minutes: int = 10,
     content_batch_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -1010,16 +1079,17 @@ def warmup_and_publish_task(
                 raise FatalError(f"Publish job not found: {job_id}")
             if job.status == "cancelled":
                 raise FatalError(f"Publish job cancelled: {job_id}")
-            # Regenerate content + image fresh every publish
+            # Regenerate content + image fresh every publish (falls back to existing)
             try:
                 await _regenerate_content(job, account_id, db)
                 await _generate_fresh_image(job, db)
-            except RetryableTaskError:
+            except FatalError:
                 raise
             except Exception as exc:
-                raise FatalError(
-                    f"Content/image regeneration failed for job {job_id}: {exc}"
-                ) from exc
+                logger.warning(
+                    "Content/image regeneration warning for job=%s: %s — proceeding",
+                    job_id, exc,
+                )
 
             job.status = "running"
             job.started_at = datetime.now(UTC)

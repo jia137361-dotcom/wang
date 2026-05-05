@@ -52,7 +52,7 @@ def dispatch_ready_tasks(
     db: Session,
     *,
     limit: int = 20,
-    dry_run: bool = True,
+    dry_run: bool = False,
 ) -> dict:
     """Scan ``scheduled_task`` for ready work and enqueue Celery tasks.
 
@@ -250,7 +250,7 @@ def _count_posts_today(account_id: str) -> int:
             select(func.count(ScheduledTask.id)).where(
                 ScheduledTask.account_id == account_id,
                 ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
-                ScheduledTask.status == "completed",
+                ScheduledTask.status.in_(["completed", "published"]),
                 ScheduledTask.finished_at >= today,
             )
         ) or 0
@@ -267,7 +267,7 @@ def _last_publish_time(account_id: str) -> datetime | None:
             .where(
                 ScheduledTask.account_id == account_id,
                 ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
-                ScheduledTask.status == "completed",
+                ScheduledTask.status.in_(["completed", "published"]),
                 ScheduledTask.finished_at != None,  # noqa: E711
             )
             .order_by(ScheduledTask.finished_at.desc())

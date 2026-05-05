@@ -30,7 +30,9 @@ def record_manual_trends(
             "recorded_at": datetime.now(UTC).isoformat(),
         }
     )
-    strategy["trend_keywords"] = cleaned
+    existing_keywords = set(strategy.get("trend_keywords", []))
+    existing_keywords.update(cleaned)
+    strategy["trend_keywords"] = sorted(existing_keywords)
     strategy["trend_history"] = trend_history[-20:]
     upsert_strategy(db, scope, strategy, version=strategy.get("version", "manual-trends"))
     return strategy

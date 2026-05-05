@@ -97,7 +97,8 @@ class PinterestReplyClient:
                         pin_url = await link_el.get_attribute("href")
 
                     if text and pin_url:
-                        comment_id = f"cmt_{hashlib.sha256((text + str(pin_url)).encode()).hexdigest()[:16]}_0"
+                        raw_id = text + str(pin_url) + (author or "")
+                        comment_id = f"cmt_{hashlib.sha256(raw_id.encode()).hexdigest()[:16]}_0"
                         comments.append(
                             SocialComment(
                                 comment_id=comment_id,

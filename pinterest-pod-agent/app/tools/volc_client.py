@@ -229,15 +229,24 @@ class VolcClient:
 
     @staticmethod
     def _extract_text(payload: dict[str, Any]) -> str:
-        content = payload["choices"][0]["message"]["content"]
-        if isinstance(content, str):
+        message = payload["choices"][0]["message"]
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
             return content.strip()
         if isinstance(content, list):
-            return "\n".join(
+            text = "\n".join(
                 item.get("text", "")
                 for item in content
                 if isinstance(item, dict) and item.get("type") in {"text", "output_text"}
             ).strip()
+            if text:
+                return text
+        # fallback: reasoning models put final answer in reasoning_content
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning.strip()
+        if isinstance(content, str):
+            return content.strip()
         raise TypeError("Unsupported response content format")
 
     @staticmethod

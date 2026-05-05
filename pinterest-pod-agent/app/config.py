@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = Field(default=True, validation_alias="SCHEDULER_ENABLED")
     scheduler_timezone: str = Field(default="Asia/Shanghai", validation_alias="SCHEDULER_TIMEZONE")
     publish_interval_minutes: int = Field(default=30, validation_alias="PUBLISH_INTERVAL_MINUTES")
-    scheduler_dry_run: bool = Field(default=True, validation_alias="SCHEDULER_DRY_RUN")
+    scheduler_dry_run: bool = Field(default=False, validation_alias="SCHEDULER_DRY_RUN")
     redis_url: str = Field(default="redis://localhost:6379", validation_alias="REDIS_URL")
     celery_broker_url: str = Field(default="redis://localhost:6379/0", validation_alias="CELERY_BROKER_URL")
     celery_result_backend: str = Field(default="redis://localhost:6379/1", validation_alias="CELERY_RESULT_BACKEND")
