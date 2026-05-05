@@ -170,6 +170,7 @@ def get_task_status(task_id: str) -> dict[str, Any]:
         )
         if t is None:
             return {"error": f"Task not found: {task_id}"}
+        result = t.result_json or {}
         return {
             "task_id": t.task_id,
             "task_type": t.task_type,
@@ -187,6 +188,9 @@ def get_task_status(task_id: str) -> dict[str, Any]:
             "error_type": t.error_type,
             "payload": t.payload_json,
             "result": t.result_json,
+            "pin_url": result.get("pin_url"),
+            "publish_evidence": result.get("publish_evidence"),
+            "debug_artifact_dir": result.get("debug_artifact_dir"),
         }
     finally:
         db.close()

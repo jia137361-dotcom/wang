@@ -1,21 +1,37 @@
-"""One-shot: clean state + create demo warmup_and_publish task."""
+"""One-shot: create a demo warmup_and_publish task.
+
+This is a local debugging helper. It only cancels prior demo-prefixed rows and
+must not be used as the normal production scheduler entry point.
+"""
 import json, uuid, sys
 sys.path.insert(0, ".")
 
 import redis
 from sqlalchemy import create_engine, text
 
+from app.config import get_settings
+
 r = redis.from_url("redis://localhost:6379/0")
 for k in r.keys("nanobot:lock:*"):
     r.delete(k)
 print("Redis locks cleared")
 
-e = create_engine("postgresql+psycopg://postgres:123456@localhost:5432/pinterest_pod")
+e = create_engine(get_settings().database_url)
 with e.connect() as c:
-    c.execute(text("UPDATE scheduled_task SET status='cancelled' WHERE status IN ('pending','running')"))
-    c.execute(text("UPDATE publish_job SET status='cancelled' WHERE status IN ('pending','running')"))
+    c.execute(text("""
+        UPDATE scheduled_task
+        SET status='cancelled', finished_at=NOW()
+        WHERE task_id LIKE 'st_demo_%'
+          AND status IN ('pending','ready','scheduled','running')
+    """))
+    c.execute(text("""
+        UPDATE publish_job
+        SET status='cancelled', finished_at=NOW()
+        WHERE job_id LIKE 'job_demo_%'
+          AND status IN ('pending','ready','running')
+    """))
     c.commit()
-    print("Stale tasks/jobs cancelled")
+    print("Old demo tasks/jobs cancelled")
 
     job_id = "job_demo_" + uuid.uuid4().hex[:8]
     st_id = "st_demo_" + uuid.uuid4().hex[:8]
@@ -31,11 +47,11 @@ with e.connect() as c:
             destination_url, image_path, content_hash, title_hash, description_hash,
             tagged_topics, product_type, niche, audience, season, offer, status, created_at, updated_at)
         VALUES (:jid, 'test-account-1', 'demo', 'Spring Motivation',
-            'Spring Into Success: Motivational Posters to Fuel Your Ambition',
-            'Transform your workspace with inspiring motivational posters.',
-            'https://example.com/motivation',
-            'var/media/images/job_8f48ec68f3ee4b45_20260504T104720Z.png',
-            'abc123', 'abc123', 'abc123',
+            'pending_auto_generation',
+            'pending_auto_generation',
+            NULL,
+            'pending_auto_generation',
+            NULL, NULL, NULL,
             '["Motivation","Poster Art","Home Office Decor"]',
             'poster', 'young professionals', 'ambitious career starters', 'spring', 'free shipping',
             'pending', NOW(), NOW())

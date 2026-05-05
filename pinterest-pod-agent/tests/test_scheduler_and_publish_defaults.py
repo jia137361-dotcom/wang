@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from app.automation.pinterest_flow import PinDraft, PinterestFlow
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from app.automation.pinterest_flow import PinDraft, PinterestFlow, PinterestFlowError
 from app.celery_app import _build_beat_schedule
 from app.evomap.prompt_evolve import PromptContext
 from app.jobs import tasks
@@ -81,6 +83,10 @@ def test_publish_pin_skips_tagged_topics(monkeypatch) -> None:
         async def wait_until_uploaded(self) -> None:
             calls.append("uploaded")
 
+        async def _upload_file_with_retry(self, image_path: Path) -> None:
+            await self._set_file_input(image_path)
+            await self.wait_until_uploaded()
+
         async def _fill_title(self, title: str) -> None:
             calls.append("title")
 
@@ -102,8 +108,13 @@ def test_publish_pin_skips_tagged_topics(monkeypatch) -> None:
         async def _click_publish_button(self) -> None:
             calls.append("publish")
 
-        async def wait_until_published(self) -> str | None:
-            return "https://www.pinterest.com/pin/123/"
+        async def wait_until_published(self) -> dict[str, object]:
+            return {
+                "success_signal": True,
+                "success_source": "pin_url",
+                "pin_url": "https://www.pinterest.com/pin/123/",
+                "final_url": "https://www.pinterest.com/pin/123/",
+            }
 
         async def save_debug_artifacts(self, label: str) -> Path:
             raise AssertionError(label)
@@ -121,6 +132,178 @@ def test_publish_pin_skips_tagged_topics(monkeypatch) -> None:
     assert result.success is True
     assert "tagged" not in calls
     assert calls[-2:] == ["validate", "publish"]
+
+
+def test_publish_pin_accepts_success_signal_without_pin_url(monkeypatch) -> None:
+    image_path = Path("unused-pin.png")
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    class Flow(PinterestFlow):
+        def __init__(self) -> None:
+            self.page = SimpleNamespace(set_default_timeout=lambda _: None)
+
+        async def _open_pin_creator(self) -> None:
+            return None
+
+        async def _upload_file_with_retry(self, image_path: Path) -> None:
+            return None
+
+        async def _fill_title(self, title: str) -> None:
+            return None
+
+        async def _fill_description(self, description: str) -> None:
+            return None
+
+        async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
+            return None
+
+        async def _ensure_on_creator(self, context: str = "") -> None:
+            return None
+
+        async def _validate_current_draft(self, draft: PinDraft) -> None:
+            return None
+
+        async def _click_publish_button(self) -> None:
+            return None
+
+        async def wait_until_published(self) -> dict[str, object]:
+            return {
+                "success_signal": True,
+                "success_source": "Your Pin was published",
+                "pin_url": None,
+                "final_url": "https://www.pinterest.com/pin-creation-tool/",
+            }
+
+        async def save_debug_artifacts(self, label: str) -> Path:
+            raise AssertionError(label)
+
+    result = asyncio.run(
+        Flow().publish_pin(
+            PinDraft(
+                title="Title",
+                description="Description",
+                board_name="Board",
+                image_path=image_path,
+            )
+        )
+    )
+
+    assert result.success is True
+    assert result.pin_url is None
+    assert result.publish_evidence["success_signal"] is True
+
+
+def test_publish_pin_rejects_draft_only_result(monkeypatch) -> None:
+    image_path = Path("unused-pin.png")
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    class Flow(PinterestFlow):
+        def __init__(self) -> None:
+            self.page = SimpleNamespace(set_default_timeout=lambda _: None)
+
+        async def _open_pin_creator(self) -> None:
+            return None
+
+        async def _upload_file_with_retry(self, image_path: Path) -> None:
+            return None
+
+        async def _fill_title(self, title: str) -> None:
+            return None
+
+        async def _fill_description(self, description: str) -> None:
+            return None
+
+        async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
+            return None
+
+        async def _ensure_on_creator(self, context: str = "") -> None:
+            return None
+
+        async def _validate_current_draft(self, draft: PinDraft) -> None:
+            return None
+
+        async def _click_publish_button(self) -> None:
+            return None
+
+        async def wait_until_published(self) -> dict[str, object]:
+            return {
+                "success_signal": False,
+                "success_source": None,
+                "pin_url": None,
+                "final_url": "https://www.pinterest.com/pin-creation-tool/",
+            }
+
+        async def save_debug_artifacts(self, label: str) -> Path:
+            return Path(".")
+
+    with pytest.raises(PinterestFlowError):
+        asyncio.run(
+            Flow().publish_pin(
+                PinDraft(
+                    title="Title",
+                    description="Description",
+                    board_name="Board",
+                    image_path=image_path,
+                )
+            )
+        )
+
+
+def test_wait_until_published_uses_success_text_without_pin_url() -> None:
+    class Page:
+        url = "https://www.pinterest.com/pin-creation-tool/"
+
+        async def wait_for_load_state(self, *args, **kwargs) -> None:
+            return None
+
+        async def wait_for_url(self, *args, **kwargs) -> None:
+            raise PlaywrightTimeoutError("timeout")
+
+        def set_default_timeout(self, timeout: int) -> None:
+            return None
+
+    class Flow(PinterestFlow):
+        async def _extract_created_pin_url(self) -> str | None:
+            return None
+
+        async def _detect_publish_success_signal(self) -> str | None:
+            return "Your Pin was published"
+
+    evidence = asyncio.run(Flow(Page()).wait_until_published())
+
+    assert evidence == {
+        "success_signal": True,
+        "success_source": "Your Pin was published",
+        "pin_url": None,
+        "final_url": "https://www.pinterest.com/pin-creation-tool/",
+    }
+
+
+def test_upload_file_with_retry_retries_once() -> None:
+    class Page:
+        def set_default_timeout(self, timeout: int) -> None:
+            return None
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            return None
+
+    class Flow(PinterestFlow):
+        def __init__(self) -> None:
+            super().__init__(Page())
+            self.attempts = 0
+
+        async def _set_file_input(self, image_path: Path) -> None:
+            self.attempts += 1
+
+        async def wait_until_uploaded(self) -> None:
+            raise RuntimeError("upload_failed")
+
+    flow = Flow()
+
+    with pytest.raises(RuntimeError, match="upload_failed after retry"):
+        asyncio.run(flow._upload_file_with_retry(Path("unused.png")))
+
+    assert flow.attempts == 2
 
 
 def test_warmup_external_navigation_goes_back() -> None:

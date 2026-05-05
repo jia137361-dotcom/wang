@@ -66,6 +66,7 @@ async def run_pin_publish_flow(
         message=result.message,
         debug_artifact_dir=result.debug_artifact_dir,
         pin_performance_id=record.id,
+        publish_evidence=result.publish_evidence,
     )
 
 
@@ -119,6 +120,7 @@ async def run_pin_publish_with_adspower(
             message=result.message,
             debug_artifact_dir=result.debug_artifact_dir,
             pin_performance_id=record.id,
+            publish_evidence=result.publish_evidence,
         )
     finally:
         if session is not None:

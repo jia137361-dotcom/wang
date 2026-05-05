@@ -129,6 +129,8 @@ def _check_final_retry_and_writeback(
                 st.locked_by = None
                 st.lock_until = None
                 st.celery_task_id = None
+                if error_type == "retryable":
+                    error_type = "final_failed"
             else:
                 # Intermediate retry — keep status=running but signal Celery
                 # is still retrying via next_retry_at so reclaim won't kill it.
@@ -146,6 +148,17 @@ def _check_final_retry_and_writeback(
             st.error_message = error_message
         if error_type is not None:
             st.error_type = error_type
+        db.commit()
+
+
+def _mark_publish_job_failed(job_id: str, error_message: str) -> None:
+    with get_sessionmaker()() as db:
+        job = db.scalar(select(PublishJob).where(PublishJob.job_id == job_id))
+        if job is None:
+            return
+        job.status = "failed"
+        job.error_message = error_message
+        job.finished_at = datetime.now(UTC)
         db.commit()
 
 
@@ -471,6 +484,7 @@ def _acquire_locks_and_publish(
                             "job_id": job_id,
                             "status": "published" if result.success else "failed",
                             "pin_url": result.pin_url,
+                            "publish_evidence": result.publish_evidence,
                             "pin_performance_id": result.pin_performance_id,
                             "debug_artifact_dir": result.debug_artifact_dir,
                             "stages": stages,
@@ -1060,7 +1074,7 @@ def warmup_task(
 def warmup_and_publish_task(
     account_id: str,
     job_id: str,
-    warmup_duration_minutes: int = 10,
+    warmup_duration_minutes: int | None = None,
     content_batch_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -1151,13 +1165,16 @@ def warmup_and_publish_task(
                 job.status = publish_status
                 job.pin_performance_id = result.pin_performance_id
                 job.finished_at = datetime.now(UTC)
+                job.error_message = None if publish_status == "published" else "Publish workflow returned failed"
                 db.commit()
 
+        publish_evidence = result.publish.publish_evidence if result.publish else None
         return {
             "account_id": account_id,
             "job_id": job_id,
             "status": publish_status,
             "pin_url": result.publish.pin_url if result.publish else None,
+            "publish_evidence": publish_evidence,
             "pin_performance_id": result.pin_performance_id,
             "warmup_seconds": result.warmup.duration_seconds if result.warmup else 0,
         }
@@ -1167,9 +1184,11 @@ def warmup_and_publish_task(
         _st_writeback(st_id, "completed", result_json=result)
         return result
     except RetryableTaskError as exc:
+        _mark_publish_job_failed(job_id, str(exc))
         _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
         raise
     except FatalError as exc:
+        _mark_publish_job_failed(job_id, str(exc))
         _st_writeback(
             st_id, "failed", error_message=str(exc), error_type="fatal"
         )
@@ -1177,12 +1196,14 @@ def warmup_and_publish_task(
     except Exception as exc:
         error_type = classify_exception(exc)
         if error_type == "fatal":
+            _mark_publish_job_failed(job_id, str(exc))
             _st_writeback(
                 st_id, "failed",
                 error_message=str(exc),
                 error_type="fatal",
             )
             raise FatalError(str(exc)) from exc
+        _mark_publish_job_failed(job_id, str(exc))
         _check_final_retry_and_writeback(
             st_id,
             error_message=str(exc),

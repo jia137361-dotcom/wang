@@ -38,7 +38,7 @@ async def run_warmup_then_publish(
     *,
     account_id: str,
     job_id: str,
-    warmup_duration_minutes: int = 5,
+    warmup_duration_minutes: int | None = None,
     adspower_client: AdsPowerClient | None = None,
     content_batch_id: str | None = None,
 ) -> WarmupPublishResult:
@@ -65,12 +65,14 @@ async def run_warmup_then_publish(
         if job is None:
             raise ValueError(f"PublishJob not found: {job_id}")
 
-        # Read warmup duration from AccountPolicy if available
-        policy = db.scalar(
-            select(AccountPolicy).where(AccountPolicy.account_id == account_id)
-        )
-        if policy and policy.warmup_duration_min:
-            warmup_duration_minutes = policy.warmup_duration_min
+        if warmup_duration_minutes is None:
+            policy = db.scalar(
+                select(AccountPolicy).where(AccountPolicy.account_id == account_id)
+            )
+            if policy and policy.warmup_duration_min:
+                warmup_duration_minutes = policy.warmup_duration_min
+            else:
+                warmup_duration_minutes = 5
 
         # Truncate title and description to Pinterest limits before creating PinDraft
         truncated_title = job.title.strip()

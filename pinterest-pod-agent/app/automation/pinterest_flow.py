@@ -6,6 +6,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from playwright.async_api import Browser, BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -40,6 +41,7 @@ class PublishResult:
     message: str = ""
     debug_artifact_dir: str | None = None
     pin_performance_id: int | None = None
+    publish_evidence: dict[str, Any] | None = None
 
 
 class PinterestFlowError(RuntimeError):
@@ -171,8 +173,7 @@ class PinterestFlow:
         try:
             await self._open_pin_creator()
 
-            await self._set_file_input(draft.image_path)
-            await self.wait_until_uploaded()
+            await self._upload_file_with_retry(draft.image_path)
 
             await self._fill_title(draft.title)
 
@@ -192,8 +193,15 @@ class PinterestFlow:
 
             await self._validate_current_draft(draft)
             await self._click_publish_button()
-            pin_url = await self.wait_until_published()
-            return PublishResult(success=True, pin_url=pin_url, message="Pin published")
+            evidence = await self.wait_until_published()
+            if not evidence.get("success_signal"):
+                raise RuntimeError("Pinterest publish did not expose a success signal")
+            return PublishResult(
+                success=True,
+                pin_url=evidence.get("pin_url"),
+                message="Pin published",
+                publish_evidence=evidence,
+            )
         except Exception as exc:
             artifact_dir = await self.save_debug_artifacts("publish_pin_failed")
             raise PinterestFlowError("Pinterest pin publish failed", debug_artifact_dir=str(artifact_dir)) from exc
@@ -269,22 +277,73 @@ class PinterestFlow:
         raise RuntimeError("Pinterest creator form did not become visible") from last_error
 
     async def wait_until_uploaded(self) -> None:
-        try:
-            await self.page.locator("text=Choose a file or drag and drop it here").wait_for(
-                state="detached",
-                timeout=20_000,
-            )
-        except PlaywrightTimeoutError:
-            logger.info("Upload placeholder remained visible; continuing with form fill")
-        await self.page.wait_for_timeout(1_000)
+        deadline = datetime.now(UTC).timestamp() + 25
+        while datetime.now(UTC).timestamp() < deadline:
+            if await self._has_uploaded_preview():
+                await self.page.wait_for_timeout(500)
+                return
+            try:
+                placeholder = self.page.locator("text=Choose a file or drag and drop it here").first
+                if await placeholder.count() == 0 or not await placeholder.is_visible():
+                    await self.page.wait_for_timeout(800)
+                    if await self._has_uploaded_preview():
+                        return
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(500)
+        raise RuntimeError("upload_failed: Pinterest did not show an uploaded image preview")
 
-    async def wait_until_published(self) -> str | None:
-        await self.page.wait_for_load_state("networkidle")
+    async def _upload_file_with_retry(self, image_path: Path) -> None:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                await self._set_file_input(image_path)
+                await self.wait_until_uploaded()
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Pinterest upload attempt %d failed: %s", attempt + 1, exc)
+                await self.page.wait_for_timeout(1_000)
+        raise RuntimeError(f"upload_failed after retry: {last_error}") from last_error
+
+    async def _has_uploaded_preview(self) -> bool:
+        try:
+            return bool(
+                await self.page.evaluate(
+                    """() => {
+                        const images = Array.from(document.querySelectorAll('img'));
+                        return images.some((img) => {
+                            if (!img.complete || img.naturalWidth <= 20 || img.naturalHeight <= 20) return false;
+                            if (img.closest('aside, nav, [role="navigation"], [data-test-id="storyboard-drafts-sidebar"], [data-test-id="drafts-container"], [data-test-id*="pinDraft" i]')) return false;
+                            const alt = (img.getAttribute('alt') || '').toLowerCase();
+                            if (alt.includes('profile') || alt.includes('avatar')) return false;
+                            const rect = img.getBoundingClientRect();
+                            return rect.width > 80 && rect.height > 80;
+                        });
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def wait_until_published(self) -> dict[str, Any]:
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeoutError:
+            logger.info("Pinterest did not reach networkidle after Publish; continuing success probes")
         try:
             await self.page.wait_for_url("**/pin/**", timeout=15_000)
         except PlaywrightTimeoutError:
             logger.info("Pin URL transition was not observed; trying result links")
-        return await self._extract_created_pin_url()
+        pin_url = await self._extract_created_pin_url()
+        success_signal = await self._detect_publish_success_signal()
+        final_url = self.page.url
+        return {
+            "success_signal": bool(pin_url or success_signal),
+            "success_source": "pin_url" if pin_url else success_signal,
+            "pin_url": pin_url,
+            "final_url": final_url,
+        }
 
     async def _ai_handle_interruptions(self, *, stage: str, objective: str) -> None:
         controls = await self.ui_decision_agent.collect_controls(self.page)
@@ -407,7 +466,7 @@ class PinterestFlow:
             "[contenteditable='true'][aria-label*='title' i]",
             "div[role='textbox'][aria-label*='title' i]",
         ]
-        await self._fill_first_available(selectors, title)
+        await self._fill_and_confirm(selectors, title[:100], field_name="title")
 
     async def _fill_description(self, description: str) -> None:
         if len(description) > 800:
@@ -433,7 +492,7 @@ class PinterestFlow:
             "div[role='textbox'][aria-label*='description' i]",
             "div[role='textbox']",
         ]
-        await self._fill_first_available(selectors, description)
+        await self._fill_and_confirm(selectors, description, field_name="description")
 
     async def _fill_destination_url(self, destination_url: str) -> None:
         selectors = [
@@ -799,7 +858,7 @@ class PinterestFlow:
             "[data-test-id='submit-pin']",
         ]
         last_error: Exception | None = None
-        safe_candidates: list[Locator] = []
+        safe_candidates: dict[str, Locator] = {}
         for selector in selectors:
             try:
                 locators = self.page.locator(selector)
@@ -811,7 +870,15 @@ class PinterestFlow:
                             continue
                         if not await self._is_safe_creator_locator(locator):
                             continue
-                        safe_candidates.append(locator)
+                        candidate_id = await locator.evaluate(
+                            """el => {
+                                if (!el.dataset.nanobotCandidateId) {
+                                    el.dataset.nanobotCandidateId = 'nb_' + Date.now() + '_' + Math.random();
+                                }
+                                return el.dataset.nanobotCandidateId;
+                            }"""
+                        )
+                        safe_candidates[str(candidate_id)] = locator
                     except Exception as exc:
                         last_error = exc
             except Exception as exc:
@@ -821,7 +888,7 @@ class PinterestFlow:
                 f"Publish button match is ambiguous or missing: {len(safe_candidates)} safe candidates"
             ) from last_error
 
-        locator = safe_candidates[0]
+        locator = next(iter(safe_candidates.values()))
         await locator.scroll_into_view_if_needed()
         await self.page.wait_for_timeout(300)
         for _ in range(40):
@@ -843,6 +910,29 @@ class PinterestFlow:
                 return href if href.startswith("http") else f"https://www.pinterest.com{href}"
         if "/pin/" in self.page.url:
             return self.page.url
+        return None
+
+    async def _detect_publish_success_signal(self) -> str | None:
+        success_selectors = [
+            "text=/your pin was published/i",
+            "text=/pin was published/i",
+            "text=/published/i",
+            "text=/changes published/i",
+            "text=/see it now/i",
+            "text=/view pin/i",
+        ]
+        for selector in success_selectors:
+            try:
+                loc = self.page.locator(selector).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    text = await loc.inner_text(timeout=1_000)
+                    normalized = self._normalize_text(text)
+                    lowered = normalized.lower()
+                    if "changes stored" in lowered or "draft" in lowered:
+                        continue
+                    return normalized or selector
+            except Exception:
+                continue
         return None
 
     async def _find_scoped_input(self, selectors: list[str]) -> "Locator | None":
@@ -881,6 +971,28 @@ class PinterestFlow:
                 last_error = exc
         raise RuntimeError(f"Could not fill field with selectors: {selectors}") from last_error
 
+    async def _fill_and_confirm(self, selectors: list[str], value: str, *, field_name: str) -> None:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                await self._fill_first_available(selectors, value)
+                await self.page.wait_for_timeout(300)
+                actual = await self._read_first_safe_value(selectors)
+                if actual is None:
+                    raise RuntimeError(f"{field_name} value could not be read after fill")
+                expected = self._normalize_text(value)
+                actual_norm = self._normalize_text(actual)
+                if actual_norm == expected or actual_norm.startswith(expected[:120]) or expected.startswith(actual_norm[:120]):
+                    return
+                raise RuntimeError(
+                    f"{field_name} fill mismatch: expected={expected[:80]!r} actual={actual_norm[:80]!r}"
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Pinterest %s fill attempt %d failed: %s", field_name, attempt + 1, exc)
+                await self.page.wait_for_timeout(700)
+        raise RuntimeError(f"{field_name}_fill_failed: {last_error}") from last_error
+
     async def _find_visible_safe_locator(self, selector: str, *, timeout_ms: int = 5_000) -> Locator | None:
         try:
             await self.page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
@@ -904,10 +1016,10 @@ class PinterestFlow:
                     """el => {
                         const unsafe = [
                             'aside',
-                            'nav',
-                            'header',
-                            '[role="navigation"]',
                             '[aria-label*="draft" i]',
+                            '[data-test-id="storyboard-drafts-sidebar"]',
+                            '[data-test-id="drafts-container"]',
+                            '[data-test-id*="pinDraft" i]',
                         ];
                         if (unsafe.some((selector) => el.closest(selector))) {
                             return false;
