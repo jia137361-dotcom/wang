@@ -72,7 +72,7 @@ async def run_warmup_then_publish(
             if policy and policy.warmup_duration_min:
                 warmup_duration_minutes = policy.warmup_duration_min
             else:
-                warmup_duration_minutes = 5
+                warmup_duration_minutes = 10
 
         # Truncate title and description to Pinterest limits before creating PinDraft
         truncated_title = job.title.strip()

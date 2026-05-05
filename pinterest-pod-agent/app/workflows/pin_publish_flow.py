@@ -102,24 +102,29 @@ async def run_pin_publish_with_adspower(
         evolver = PromptEvolver(db=db)
         content_prompt = evolver.build_content_prompt(workflow_input.prompt_context)
         result = await pinterest.publish_pin(_draft_from_input(workflow_input))
-        record = _record_publish(
-            db=db,
-            evolver=evolver,
-            workflow_input=workflow_input,
-            result=result,
-            content_prompt=content_prompt,
-            content_batch_id=content_batch_id,
-            variant_angle=variant_angle,
-            content_hash=content_hash,
-            title_hash=title_hash,
-            description_hash=description_hash,
-        )
+        try:
+            record = _record_publish(
+                db=db,
+                evolver=evolver,
+                workflow_input=workflow_input,
+                result=result,
+                content_prompt=content_prompt,
+                content_batch_id=content_batch_id,
+                variant_angle=variant_angle,
+                content_hash=content_hash,
+                title_hash=title_hash,
+                description_hash=description_hash,
+            )
+            pin_perf_id: int | None = record.id
+        except Exception:
+            logger.exception("PinPerformance recording failed — publish is still successful")
+            pin_perf_id = None
         return PublishResult(
             success=result.success,
             pin_url=result.pin_url,
             message=result.message,
             debug_artifact_dir=result.debug_artifact_dir,
-            pin_performance_id=record.id,
+            pin_performance_id=pin_perf_id,
             publish_evidence=result.publish_evidence,
         )
     finally:

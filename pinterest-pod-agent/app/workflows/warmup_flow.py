@@ -143,30 +143,33 @@ async def run_warmup_session(
     # 2. Time-driven main loop — keep acting until deadline
     unused_keywords: list[str] = list(SEARCH_KEYWORDS)
     while time.time() < deadline - 3:  # leave room for final cooldown
-        roll = random.random()
-        if enable_pin_engagement and roll < 0.15:
-            ok = await _interact_with_random_pin(page, human, enable_save=enable_save)
-            actions += 1
-            if ok:
-                interactions += 1
-        elif roll < 0.65:
-            scrolls = random.randint(2, 5)
-            await _random_scroll_activity(
-                page, human, count=scrolls,
-                enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
-            )
-            actions += 1
-        else:
-            if not unused_keywords:
-                unused_keywords = list(SEARCH_KEYWORDS)
-            kw = random.choice(unused_keywords)
-            unused_keywords.remove(kw)
-            await _search_and_browse(
-                page, human, kw,
-                enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
-            )
-            searches += 1
-            actions += 1
+        try:
+            roll = random.random()
+            if enable_pin_engagement and roll < 0.15:
+                ok = await _interact_with_random_pin(page, human, enable_save=enable_save)
+                actions += 1
+                if ok:
+                    interactions += 1
+            elif roll < 0.65:
+                scrolls = random.randint(2, 5)
+                await _random_scroll_activity(
+                    page, human, count=scrolls,
+                    enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
+                )
+                actions += 1
+            else:
+                if not unused_keywords:
+                    unused_keywords = list(SEARCH_KEYWORDS)
+                kw = random.choice(unused_keywords)
+                unused_keywords.remove(kw)
+                await _search_and_browse(
+                    page, human, kw,
+                    enable_pin_engagement=enable_pin_engagement, enable_save=enable_save,
+                )
+                searches += 1
+                actions += 1
+        except Exception:
+            logger.exception("Warmup action failed, continuing")
         await asyncio.sleep(random.uniform(1.0, 3.0))
 
     # 3. Cooldown — wait until the real deadline
