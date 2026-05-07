@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import logging
 import json
 from dataclasses import asdict
@@ -173,9 +174,13 @@ class PinterestFlow:
         try:
             await self._open_pin_creator()
 
+            await self._dismiss_error_dialogs()
+
             await self._upload_file_with_retry(draft.image_path)
 
             await self._fill_title(draft.title)
+
+            await self.page.wait_for_timeout(500)  # let React settle after title fill
 
             await self._fill_description(draft.description)
 
@@ -189,13 +194,21 @@ class PinterestFlow:
                 await self._fill_alt_text(draft.alt_text)
 
             if draft.tagged_topics:
-                logger.info("Tagged topics fill is disabled; skipping topics=%s", draft.tagged_topics)
+                await self._fill_tagged_topics(draft.tagged_topics)
 
             await self._validate_current_draft(draft)
             await self._click_publish_button()
             evidence = await self.wait_until_published()
             if not evidence.get("success_signal"):
-                raise RuntimeError("Pinterest publish did not expose a success signal")
+                logger.warning(
+                    "Pinterest publish completed but no success signal detected. Evidence=%s", evidence,
+                )
+                return PublishResult(
+                    success=False,
+                    pin_url=evidence.get("pin_url"),
+                    message="Pin publish unconfirmed (no success signal detected)",
+                    publish_evidence=evidence,
+                )
             return PublishResult(
                 success=True,
                 pin_url=evidence.get("pin_url"),
@@ -203,8 +216,18 @@ class PinterestFlow:
                 publish_evidence=evidence,
             )
         except Exception as exc:
+            try:
+                current_url = self.page.url
+            except Exception:
+                current_url = "<unknown>"
+            logger.error(
+                "Pinterest publish failed at url=%s: %s", current_url, exc,
+                extra={"draft_title": draft.title[:80], "draft_board": draft.board_name},
+            )
             artifact_dir = await self.save_debug_artifacts("publish_pin_failed")
-            raise PinterestFlowError("Pinterest pin publish failed", debug_artifact_dir=str(artifact_dir)) from exc
+            raise PinterestFlowError(
+                f"Pinterest pin publish failed: {exc}", debug_artifact_dir=str(artifact_dir)
+            ) from exc
 
     async def _open_pin_creator(self) -> None:
         creator_urls = [
@@ -212,12 +235,32 @@ class PinterestFlow:
             "https://www.pinterest.com/pin-builder/",
         ]
         for url in creator_urls:
-            await self.page.goto(url, wait_until="domcontentloaded")
-            if await self._has_file_input(timeout_ms=20_000):
-                await self._wait_for_creator_form()
-                # Let Pinterest React hydrate so the file input's change handler is wired up.
-                await self.page.wait_for_timeout(3000)
-                return
+            for attempt in range(3):
+                await self.page.goto(url, wait_until="domcontentloaded")
+                if not await self._has_file_input(timeout_ms=15_000):
+                    continue  # try next URL
+                # Allow extra time for Pinterest SSR to deliver the React shell.
+                # Slow proxy or backend latency can cause the UserResource to
+                # time out, which leaves the form in a broken half-rendered state.
+                try:
+                    await self.page.wait_for_load_state("load", timeout=10_000)
+                except PlaywrightTimeoutError:
+                    logger.warning("Page load event did not fire within 10s for %s", url)
+                await self.page.wait_for_timeout(2000)
+                try:
+                    await self._wait_for_creator_form()
+                    # Let Pinterest React hydrate so the file input's change handler is wired up.
+                    await self.page.wait_for_timeout(3000)
+                    return
+                except RuntimeError:
+                    if attempt < 2:
+                        logger.warning(
+                            "Creator form not ready on %s (attempt %d), reloading...",
+                            url,
+                            attempt + 1,
+                        )
+                        continue
+                    raise
         await self.page.goto("https://www.pinterest.com/", wait_until="domcontentloaded")
         try:
             await self._open_pin_creator_from_create_menu()
@@ -279,6 +322,31 @@ class PinterestFlow:
                 last_error = exc
         raise RuntimeError("Pinterest creator form did not become visible") from last_error
 
+    async def _dismiss_error_dialogs(self) -> None:
+        """Close Pinterest error / alert dialogs that may block form interaction.
+
+        These appear when the React app encounters an unhandled exception (often
+        a consequence of an SSR timeout like UserResource 408).  If left open,
+        the dialog obscures the form and prevents filling or clicking.
+        """
+        dismiss_selectors = [
+            "button:has-text('Okay')",
+            "button:has-text('OK')",
+            "[role='dialog'] button:has-text('Okay')",
+            "[role='alertdialog'] button",
+            "div[role='button']:has-text('Okay')",
+        ]
+        for sel in dismiss_selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    await self.page.wait_for_timeout(1000)
+                    logger.info("Dismissed error dialog with selector: %s", sel)
+                    return
+            except Exception:
+                continue
+
     async def wait_until_uploaded(self) -> None:
         deadline = datetime.now(UTC).timestamp() + 25
         while datetime.now(UTC).timestamp() < deadline:
@@ -296,7 +364,7 @@ class PinterestFlow:
             except Exception:
                 pass
             await self.page.wait_for_timeout(500)
-        logger.warning("Upload preview not detected within deadline; continuing with form fill")
+        raise RuntimeError("upload_preview_timeout: upload preview not detected within 25s deadline")
 
     async def _is_title_input_enabled(self) -> bool:
         """Check that the storyboard title input is not disabled."""
@@ -309,15 +377,17 @@ class PinterestFlow:
             return False
 
     async def _upload_file_with_retry(self, image_path: Path) -> None:
+        last_error: Exception | None = None
         for attempt in range(2):
             try:
                 await self._set_file_input(image_path)
                 await self.wait_until_uploaded()
                 return
             except Exception as exc:
+                last_error = exc
                 logger.warning("Pinterest upload attempt %d failed: %s", attempt + 1, exc)
                 await self.page.wait_for_timeout(1_000)
-        logger.warning("Upload retries exhausted; continuing with form fill anyway")
+        raise RuntimeError("upload_failed after retry") from last_error
 
     async def _has_uploaded_preview(self) -> bool:
         try:
@@ -484,14 +554,18 @@ class PinterestFlow:
             logger.warning("Title truncated from %d to 100 chars", len(title))
             title = title[:100].strip()
         # Wait for the title input to become enabled (Pinterest enables it after upload)
+        title_enabled = False
         for _ in range(60):
             try:
                 title_input = self.page.locator("#storyboard-selector-title")
                 if await title_input.count() > 0 and await title_input.is_enabled():
+                    title_enabled = True
                     break
             except Exception:
                 pass
             await self.page.wait_for_timeout(500)
+        if not title_enabled:
+            raise RuntimeError("title_input_not_enabled: #storyboard-selector-title did not become enabled within 30s")
         selectors = [
             "input[placeholder='Add a title']",
             "input[placeholder*='Add a title' i]",
@@ -519,15 +593,17 @@ class PinterestFlow:
             logger.warning("Description truncated from %d to %d chars", len(description), len(truncated))
             description = truncated
         selectors = [
+            # Pinterest now uses a Draft.js contenteditable div, not a textarea.
+            # Put contenteditable-based selectors first to avoid 30 s of textarea timeouts.
+            "[contenteditable='true'][aria-label*='detailed description' i]",
+            "[contenteditable='true'][aria-label*='description' i]",
+            "div[contenteditable='true'][role='combobox']",
+            "[data-test-id='editor-with-mentions'] [contenteditable='true']",
+            "[data-test-id='comment-editor-container'] [contenteditable='true']",
+            "#storyboard-description-field-container [contenteditable='true']",
+            # Fallback: older Pinterest UI that used a real textarea
             "textarea[placeholder='Add a detailed description']",
             "textarea[placeholder*='detailed description' i]",
-            "div[role='textbox'][aria-label='Description']",
-            "[data-test-id='pin-draft-description'] textarea",
-            "[data-test-id='pin-draft-description'] [contenteditable='true']",
-            "textarea[placeholder*='description' i]",
-            "[contenteditable='true'][aria-label*='description' i]",
-            "div[role='textbox'][aria-label*='description' i]",
-            "div[role='textbox']",
         ]
         await self._fill_and_confirm(selectors, description, field_name="description")
 
@@ -953,10 +1029,20 @@ class PinterestFlow:
         success_selectors = [
             "text=/your pin was published/i",
             "text=/pin was published/i",
+            "text=/pin published/i",
             "text=/published/i",
             "text=/changes published/i",
             "text=/see it now/i",
             "text=/view pin/i",
+            "text=/pin created/i",
+            "text=/your pin is live/i",
+            "text=/successfully published/i",
+            "[data-test-id='pin-publish-success']",
+            "[data-test-id='publish-success-toast']",
+            "[role='alert']:has-text('published')",
+            "h1:has-text('Published')",
+            "div:has-text('Your Pin was published')",
+            "div:has-text('See it now')",
         ]
         for selector in success_selectors:
             try:
@@ -997,37 +1083,69 @@ class PinterestFlow:
                 locator = await self._find_visible_safe_locator(selector, timeout_ms=timeout_ms)
                 if locator is None:
                     continue
+                # Draft.js contenteditable divs need keyboard typing so React
+                # event handlers fire and Draft.js internal state updates.
                 try:
-                    await locator.fill(value)
+                    class_name = await locator.get_attribute("class") or ""
                 except Exception:
+                    class_name = ""
+                if "public-DraftEditor-content" in class_name:
                     await locator.click()
+                    await self.page.wait_for_timeout(200)
                     await self.page.keyboard.press("Control+A")
-                    await self.page.keyboard.type(value)
+                    await self.page.keyboard.press("Backspace")
+                    await self.page.keyboard.type(value, delay=10)
+                else:
+                    try:
+                        await locator.fill(value)
+                    except Exception:
+                        await locator.click()
+                        await self.page.keyboard.press("Control+A")
+                        await self.page.keyboard.type(value)
                 return
             except Exception as exc:  # Playwright selector fallback should keep trying.
                 last_error = exc
         raise RuntimeError(f"Could not fill field with selectors: {selectors}") from last_error
 
     async def _fill_and_confirm(self, selectors: list[str], value: str, *, field_name: str) -> None:
+        if not value.strip():
+            raise RuntimeError(f"refusing to fill empty {field_name}")
         last_error: Exception | None = None
         for attempt in range(2):
             try:
                 await self._fill_first_available(selectors, value)
-                await self.page.wait_for_timeout(300)
+                await self.page.wait_for_timeout(1000)
                 actual = await self._read_first_safe_value(selectors)
                 if actual is None:
                     raise RuntimeError(f"{field_name} value could not be read after fill")
                 expected = self._normalize_text(value)
                 actual_norm = self._normalize_text(actual)
-                if actual_norm == expected or actual_norm.startswith(expected[:120]) or expected.startswith(actual_norm[:120]):
+                if not expected:
+                    raise RuntimeError(f"{field_name} expected value is empty after normalization")
+                # Fast path: prefix match
+                if actual_norm.startswith(expected[:120]) or expected.startswith(actual_norm[:120]):
+                    return
+                # Fuzzy path: similarity threshold for contenteditable quirks
+                similarity = difflib.SequenceMatcher(None, actual_norm, expected).ratio()
+                if similarity > 0.8:
+                    logger.info(
+                        "%s fill accepted via fuzzy match (similarity=%.2f, expected[:60]=%r, actual[:60]=%r)",
+                        field_name, similarity, expected[:60], actual_norm[:60],
+                    )
                     return
                 raise RuntimeError(
-                    f"{field_name} fill mismatch: expected={expected[:80]!r} actual={actual_norm[:80]!r}"
+                    f"{field_name} fill mismatch (similarity={similarity:.2f}): "
+                    f"expected={expected[:80]!r} actual={actual_norm[:80]!r}"
                 )
             except Exception as exc:
                 last_error = exc
                 logger.warning("Pinterest %s fill attempt %d failed: %s", field_name, attempt + 1, exc)
                 await self.page.wait_for_timeout(700)
+        # Save debug artifacts before raising
+        try:
+            await self.save_debug_artifacts(f"fill_{field_name}_failed")
+        except Exception:
+            pass
         raise RuntimeError(f"{field_name}_fill_failed: {last_error}") from last_error
 
     async def _find_visible_safe_locator(self, selector: str, *, timeout_ms: int = 5_000) -> Locator | None:
@@ -1079,12 +1197,19 @@ class PinterestFlow:
             return False
 
     async def _validate_current_draft(self, draft: PinDraft) -> None:
+        if not draft.title or not draft.title.strip():
+            raise RuntimeError("Refusing to publish: draft title is empty")
+        if not draft.description or not draft.description.strip():
+            raise RuntimeError("Refusing to publish: draft description is empty")
         title_value = await self._read_first_safe_value(
             [
                 "input[placeholder='Add a title']",
                 "input[placeholder*='Add a title' i]",
+                "[aria-label='Title'] input",
                 "[data-test-id='pin-draft-title'] textarea",
                 "[data-test-id='pin-draft-title'] [contenteditable='true']",
+                "textarea[placeholder*='title' i]",
+                "input[placeholder*='title' i]",
                 "[contenteditable='true'][aria-label*='title' i]",
                 "div[role='textbox'][aria-label*='title' i]",
             ]
@@ -1093,19 +1218,34 @@ class PinterestFlow:
             [
                 "textarea[placeholder='Add a detailed description']",
                 "textarea[placeholder*='detailed description' i]",
+                "div[role='textbox'][aria-label='Description']",
                 "[data-test-id='pin-draft-description'] textarea",
                 "[data-test-id='pin-draft-description'] [contenteditable='true']",
+                "textarea[placeholder*='description' i]",
                 "[contenteditable='true'][aria-label*='description' i]",
                 "div[role='textbox'][aria-label*='description' i]",
             ]
         )
-        if title_value is not None and self._normalize_text(title_value) != self._normalize_text(draft.title[:100]):
-            raise RuntimeError("Current Pinterest draft title does not match this job; refusing to publish")
+        if title_value is not None:
+            expected = self._normalize_text(draft.title[:100])
+            actual = self._normalize_text(title_value)
+            if not (actual.startswith(expected[:120]) or expected.startswith(actual[:120])):
+                similarity = difflib.SequenceMatcher(None, actual, expected).ratio()
+                if similarity <= 0.8:
+                    raise RuntimeError(
+                        f"Current Pinterest draft title does not match this job "
+                        f"(similarity={similarity:.2f}); refusing to publish"
+                    )
         if description_value is not None:
             expected = self._normalize_text(draft.description[: min(len(draft.description), 800)])
             actual = self._normalize_text(description_value)
             if expected and not (actual.startswith(expected[:120]) or expected.startswith(actual[:120])):
-                raise RuntimeError("Current Pinterest draft description does not match this job; refusing to publish")
+                similarity = difflib.SequenceMatcher(None, actual, expected).ratio()
+                if similarity <= 0.8:
+                    raise RuntimeError(
+                        f"Current Pinterest draft description does not match this job "
+                        f"(similarity={similarity:.2f}); refusing to publish"
+                    )
 
     async def _read_first_safe_value(self, selectors: list[str]) -> str | None:
         for selector in selectors:

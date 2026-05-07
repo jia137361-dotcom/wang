@@ -65,14 +65,18 @@ def test_generated_board_and_topics_have_fallbacks() -> None:
     ]
 
 
-def test_publish_pin_skips_tagged_topics(monkeypatch) -> None:
+def test_publish_pin_fills_tagged_topics(monkeypatch) -> None:
     image_path = Path("unused-pin.png")
     monkeypatch.setattr(Path, "exists", lambda self: True)
     calls: list[str] = []
 
     class Flow(PinterestFlow):
         def __init__(self) -> None:
-            self.page = SimpleNamespace(set_default_timeout=lambda _: None)
+            self.page = SimpleNamespace(
+                set_default_timeout=lambda _: None,
+                url="https://www.pinterest.com/pin-creation-tool/",
+                wait_for_timeout=lambda _: asyncio.sleep(0),
+            )
 
         async def _open_pin_creator(self) -> None:
             calls.append("open")
@@ -130,7 +134,7 @@ def test_publish_pin_skips_tagged_topics(monkeypatch) -> None:
     result = asyncio.run(Flow().publish_pin(draft))
 
     assert result.success is True
-    assert "tagged" not in calls
+    assert "tagged" in calls
     assert calls[-2:] == ["validate", "publish"]
 
 
@@ -140,7 +144,11 @@ def test_publish_pin_accepts_success_signal_without_pin_url(monkeypatch) -> None
 
     class Flow(PinterestFlow):
         def __init__(self) -> None:
-            self.page = SimpleNamespace(set_default_timeout=lambda _: None)
+            self.page = SimpleNamespace(
+                set_default_timeout=lambda _: None,
+                url="https://www.pinterest.com/pin-creation-tool/",
+                wait_for_timeout=lambda _: asyncio.sleep(0),
+            )
 
         async def _open_pin_creator(self) -> None:
             return None
@@ -193,13 +201,18 @@ def test_publish_pin_accepts_success_signal_without_pin_url(monkeypatch) -> None
     assert result.publish_evidence["success_signal"] is True
 
 
-def test_publish_pin_rejects_draft_only_result(monkeypatch) -> None:
+def test_publish_pin_unconfirmed_when_signal_missing(monkeypatch) -> None:
+    """When no success signal detected, return success=False so the task can retry."""
     image_path = Path("unused-pin.png")
     monkeypatch.setattr(Path, "exists", lambda self: True)
 
     class Flow(PinterestFlow):
         def __init__(self) -> None:
-            self.page = SimpleNamespace(set_default_timeout=lambda _: None)
+            self.page = SimpleNamespace(
+                set_default_timeout=lambda _: None,
+                url="https://www.pinterest.com/pin-creation-tool/",
+                wait_for_timeout=lambda _: asyncio.sleep(0),
+            )
 
         async def _open_pin_creator(self) -> None:
             return None
@@ -236,17 +249,19 @@ def test_publish_pin_rejects_draft_only_result(monkeypatch) -> None:
         async def save_debug_artifacts(self, label: str) -> Path:
             return Path(".")
 
-    with pytest.raises(PinterestFlowError):
-        asyncio.run(
-            Flow().publish_pin(
-                PinDraft(
-                    title="Title",
-                    description="Description",
-                    board_name="Board",
-                    image_path=image_path,
-                )
+    result = asyncio.run(
+        Flow().publish_pin(
+            PinDraft(
+                title="Title",
+                description="Description",
+                board_name="Board",
+                image_path=image_path,
             )
         )
+    )
+
+    assert result.success is False
+    assert "unconfirmed" in result.message.lower()
 
 
 def test_wait_until_published_uses_success_text_without_pin_url() -> None:

@@ -271,6 +271,7 @@ async def _regenerate_content(
 
         # accepted — write back
         board = _clean_generated_board(content.get("board"), context)
+        topics = _clean_generated_topics(content.get("tagged_topics"), context)
 
         job.title = title[:100]
         job.description = description
@@ -278,6 +279,8 @@ async def _regenerate_content(
         job.description_hash = dedup.stable_hash(description)
         job.content_hash = dedup.stable_hash(f"{title}|{description}")
         job.board_name = board
+        job.tagged_topics = __import__("json").dumps(topics, ensure_ascii=False)
+        job.variant_angle = content.get("angle") or job.variant_angle
         db.commit()
         logger.info(
             "Content regenerated job=%s title=%.60s... board=%s hash=%s",
@@ -435,12 +438,16 @@ def _acquire_locks_and_publish(
     profile_id: str,
     batch_id: str,
     job: PublishJob,
+    scheduled_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Acquire both account and profile Redis locks, then run the publish flow."""
     from app.safety.locks import account_lock, profile_lock
 
     async def _run() -> dict[str, Any]:
         stages: list[dict[str, Any]] = []
+        # heartbeat before entering browser automation so reclaim doesn't
+        # reset a live task that's just waiting on Pinterest network
+        _update_heartbeat(scheduled_task_id, account_id, profile_id)
 
         async with account_lock(account_id) as acct_held:
             if not acct_held:
@@ -504,6 +511,25 @@ class RetryableTaskError(Exception):
     """Transient error that Celery should retry."""
 
 
+def _handle_task_exception(
+    exc: Exception,
+    st_id: str | None,
+) -> None:
+    """Route exception to the correct writeback: fatal → failed, retryable → retry."""
+    if isinstance(exc, RetryableTaskError):
+        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
+        raise
+    if isinstance(exc, FatalError):
+        _st_writeback(st_id, "failed", error_message=str(exc), error_type="fatal")
+        raise
+    error_type = classify_exception(exc)
+    if error_type == "fatal":
+        _st_writeback(st_id, "failed", error_message=str(exc), error_type="fatal")
+        raise FatalError(str(exc)) from exc
+    _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type=error_type)
+    raise RetryableTaskError(str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # tasks
 # ---------------------------------------------------------------------------
@@ -524,21 +550,8 @@ def generate_image_asset_task(
         result = asdict(asset)
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
@@ -565,28 +578,15 @@ def generate_image_for_publish_job_task(
         result = asdict(asset) | {"job_id": job_id}
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
     name="app.jobs.publish_job",
     autoretry_for=(RetryableTaskError,),
-    max_retries=0,
-    default_retry_delay=60,
+    max_retries=1,
+    default_retry_delay=120,
 )
 def publish_job_task(
     job_id: str, dry_run: bool = False, content_batch_id: str | None = None, **kwargs: Any
@@ -656,6 +656,7 @@ def publish_job_task(
             profile_id=profile_id,
             batch_id=batch_id,
             job=job,
+            scheduled_task_id=st_id,
         )
         with get_sessionmaker()() as db:
             job = _get_publish_job(db, job_id)
@@ -681,7 +682,7 @@ def publish_job_task(
                 error_type="fatal",
             )
             raise FatalError(str(exc)) from exc
-        # max_retries=0 means we never retry — write back immediately
+        # mark scheduled_task as failed; Celery may retry once (max_retries=1)
         _st_writeback(
             st_id, "failed",
             error_message=str(exc),
@@ -726,21 +727,8 @@ def refresh_current_event_trends_task(
             result = run_async(refresh_current_event_trends(db, scope=scope, query=query, limit=limit))
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
@@ -770,21 +758,8 @@ def refresh_product_trends_task(
             )
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
@@ -815,21 +790,8 @@ def generate_marketing_video_task(
         result = asdict(video)
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
@@ -896,21 +858,8 @@ def auto_reply_task(
         result = run_async(_locked_reply())
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(name="app.jobs.cleanup_assets")
@@ -1048,27 +997,14 @@ def warmup_task(
         result = run_async(_run())
         _st_writeback(st_id, "completed", result_json=result)
         return result
-    except RetryableTaskError as exc:
-        _check_final_retry_and_writeback(st_id, error_message=str(exc), error_type="retryable")
-        raise
-    except FatalError as exc:
-        _st_writeback(
-            st_id, "failed", error_message=str(exc), error_type="fatal"
-        )
-        raise
     except Exception as exc:
-        _check_final_retry_and_writeback(
-            st_id,
-            error_message=str(exc),
-            error_type=classify_exception(exc),
-        )
-        raise RetryableTaskError(str(exc)) from exc
+        _handle_task_exception(exc, st_id)
 
 
 @celery_app.task(
     name="app.jobs.warmup_and_publish",
     autoretry_for=(RetryableTaskError,),
-    max_retries=0,
+    max_retries=2,
     default_retry_delay=300,
 )
 def warmup_and_publish_task(
@@ -1181,7 +1117,14 @@ def warmup_and_publish_task(
 
     try:
         result = run_async(_run())
-        _st_writeback(st_id, "completed", result_json=result)
+        final_status = "completed" if result.get("status") in {"published", "dry_run_skipped"} else "failed"
+        _st_writeback(
+            st_id,
+            final_status,
+            result_json=result,
+            error_message=None if final_status == "completed" else result.get("status", "Publish workflow failed"),
+            error_type=None if final_status == "completed" else "publish_failed",
+        )
         return result
     except RetryableTaskError as exc:
         _mark_publish_job_failed(job_id, str(exc))
