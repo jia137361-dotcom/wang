@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from app.evomap.strategy_matrix import get_strategy, upsert_strategy
-from app.tools.trend_sources import CurrentEventsTrendClient, ProductTrendClient, TrendFetchResult, TrendSignal
+from app.tools.trend_sources import (
+    TrendFetchResult,
+    TrendSignal,
+    fetch_current_events_trends,
+    fetch_product_trends,
+)
 
 
 async def refresh_current_event_trends(
@@ -16,7 +21,7 @@ async def refresh_current_event_trends(
     limit: int = 20,
 ) -> dict:
     """刷新时事趋势；外部数据源未配置时会写入空结果快照。"""
-    fetch_result = await CurrentEventsTrendClient().fetch_result(query=query, limit=limit)
+    fetch_result = await fetch_current_events_trends(query=query, limit=limit)
     return _store_trend_signals(
         db,
         scope=scope,
@@ -35,7 +40,7 @@ async def refresh_product_trends(
     limit: int = 20,
 ) -> dict:
     """刷新爆品趋势；外部数据源未配置时会写入空结果快照。"""
-    fetch_result = await ProductTrendClient().fetch_result(
+    fetch_result = await fetch_product_trends(
         niche=niche, product_type=product_type, limit=limit
     )
     return _store_trend_signals(

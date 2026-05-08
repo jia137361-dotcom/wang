@@ -80,6 +80,8 @@ powershell -ExecutionPolicy Bypass -File scripts\start_all.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\stop_all.ps1
 ```
+taskkill /f /im celery.exe
+taskkill /f /im python.exe
 
 健康检查：
 
@@ -91,6 +93,7 @@ Invoke-RestMethod http://127.0.0.1:8900/health
 ## 6. nanobot 常用指令
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts\nanobot.ps1 "为账号 test-account-1 的发布任务 手动创建新 Job  并创建一个暖机加发布任务，暖机 5 分钟，立即执行"
 powershell -ExecutionPolicy Bypass -File scripts\nanobot.ps1 "检查服务健康状态"
 powershell -ExecutionPolicy Bypass -File scripts\nanobot.ps1 "查看今天所有账号的任务状态"
 powershell -ExecutionPolicy Bypass -File scripts\nanobot.ps1 "检查所有账号的 AdsPower profile 状态"

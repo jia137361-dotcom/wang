@@ -159,44 +159,22 @@ def _coerce_weight(value: Any) -> float:
     return max(parsed, 0.0)
 
 
-class CurrentEventsTrendClient:
-    """Pinterest-backed current-event trend client."""
-
-    async def fetch(self, *, query: str | None = None, limit: int = 20) -> list[TrendSignal]:
-        return (await self.fetch_result(query=query, limit=limit)).signals
-
-    async def fetch_result(self, *, query: str | None = None, limit: int = 20) -> TrendFetchResult:
-        return await PinterestTrendProvider().fetch(
-            query=query,
-            limit=limit,
-            trend_type="current_events",
-        )
+async def fetch_current_events_trends(
+    *, query: str | None = None, limit: int = 20
+) -> TrendFetchResult:
+    """Fetch Pinterest current-event trends."""
+    return await PinterestTrendProvider().fetch(
+        query=query, limit=limit, trend_type="current_events"
+    )
 
 
-class ProductTrendClient:
-    """Pinterest-backed POD/product trend client."""
-
-    async def fetch(
-        self,
-        *,
-        niche: str | None = None,
-        product_type: str | None = None,
-        limit: int = 20,
-    ) -> list[TrendSignal]:
-        return (
-            await self.fetch_result(niche=niche, product_type=product_type, limit=limit)
-        ).signals
-
-    async def fetch_result(
-        self,
-        *,
-        niche: str | None = None,
-        product_type: str | None = None,
-        limit: int = 20,
-    ) -> TrendFetchResult:
-        return await PinterestTrendProvider().fetch(
-            niche=niche,
-            product_type=product_type,
-            limit=limit,
-            trend_type="product",
-        )
+async def fetch_product_trends(
+    *,
+    niche: str | None = None,
+    product_type: str | None = None,
+    limit: int = 20,
+) -> TrendFetchResult:
+    """Fetch Pinterest POD/product trends."""
+    return await PinterestTrendProvider().fetch(
+        niche=niche, product_type=product_type, limit=limit, trend_type="product"
+    )

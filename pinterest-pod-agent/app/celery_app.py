@@ -138,5 +138,19 @@ else:
         def _on_worker_shutdown(**kwargs: Any) -> None:
             """Gracefully close any orphaned browser sessions on worker exit."""
             logger.info("Celery worker shutting down — cleaning up browser sessions")
+            # Release any held Redis locks and close connections
+            try:
+                from app.safety.locks import _get_redis, _get_redis_sync
+                import asyncio
+                async def _close_async() -> None:
+                    r = await _get_redis()
+                    await r.aclose()
+                asyncio.get_event_loop().run_until_complete(_close_async())
+            except Exception:
+                pass
+            try:
+                _get_redis_sync().close()
+            except Exception:
+                pass
     except ImportError:
         pass

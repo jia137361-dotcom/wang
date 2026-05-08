@@ -69,7 +69,7 @@ def analytics_summary(
     if product_type:
         stmt = stmt.where(PinPerformance.product_type == product_type)
 
-    rows = list(db.scalars(stmt).all())
+    rows = list(db.scalars(stmt.limit(2000)).all())
     keyword_counter: Counter[str] = Counter()
     for row in rows:
         keyword_counter.update(row.keywords or [])

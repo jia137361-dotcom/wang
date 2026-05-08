@@ -18,3 +18,20 @@ class PromptBuildResponse(BaseModel):
 
 class StrategyAdviceResponse(BaseModel):
     advice: str
+
+
+class ContentTemplateUpsert(BaseModel):
+    scope: str = Field(max_length=120)
+    template_type: str = Field(pattern="^(title_description|image_prompt)$")
+    template_text: str = Field(min_length=1)
+    is_active: bool = True
+
+
+class ContentTemplateRead(BaseModel):
+    id: int
+    scope: str
+    template_type: str
+    template_text: str
+    is_active: bool
+
+    model_config = {"from_attributes": True}

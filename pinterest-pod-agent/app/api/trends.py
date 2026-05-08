@@ -53,7 +53,10 @@ def refresh_current_event_trends(
     scope: str,
     payload: CurrentEventTrendRefreshPayload,
 ) -> TrendRefreshResponse:
-    result = refresh_current_event_trends_task.delay(scope, payload.query, payload.limit)
+    try:
+        result = refresh_current_event_trends_task.delay(scope, payload.query, payload.limit)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     return TrendRefreshResponse(
         task_id=getattr(result, "id", None),
         task_name="app.jobs.refresh_current_event_trends",
@@ -65,12 +68,15 @@ def refresh_product_trends(
     scope: str,
     payload: ProductTrendRefreshPayload,
 ) -> TrendRefreshResponse:
-    result = refresh_product_trends_task.delay(
-        scope,
-        payload.niche,
-        payload.product_type,
-        payload.limit,
-    )
+    try:
+        result = refresh_product_trends_task.delay(
+            scope,
+            payload.niche,
+            payload.product_type,
+            payload.limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     return TrendRefreshResponse(
         task_id=getattr(result, "id", None),
         task_name="app.jobs.refresh_product_trends",

@@ -67,6 +67,9 @@ CREATE INDEX IF NOT EXISTS ix_pin_performance_title_hash
 CREATE INDEX IF NOT EXISTS ix_pin_performance_content_batch_id
     ON pin_performance (content_batch_id);
 
+CREATE INDEX IF NOT EXISTS ix_pin_performance_description_hash
+    ON pin_performance (description_hash);
+
 CREATE TABLE IF NOT EXISTS global_strategy (
     id SERIAL PRIMARY KEY,
     scope VARCHAR(120) NOT NULL,
@@ -176,6 +179,9 @@ CREATE INDEX IF NOT EXISTS ix_publish_job_title_hash
 
 CREATE INDEX IF NOT EXISTS ix_publish_job_content_batch_id
     ON publish_job (content_batch_id);
+
+CREATE INDEX IF NOT EXISTS ix_publish_job_description_hash
+    ON publish_job (description_hash);
 
 CREATE TABLE IF NOT EXISTS token_usage (
     id SERIAL PRIMARY KEY,

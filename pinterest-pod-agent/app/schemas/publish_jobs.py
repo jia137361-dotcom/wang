@@ -40,6 +40,7 @@ class ContentGenerateResponse(BaseModel):
     title: str
     description: str
     keywords: str = "[]"
+    tagged_topics: str = "[]"
     angle: str = ""
     style_variant: str = ""
     title_hash: str = ""

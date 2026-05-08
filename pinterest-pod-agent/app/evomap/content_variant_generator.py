@@ -30,6 +30,7 @@ class VariantResult:
     title: str = ""
     description: str = ""
     keywords: str = "[]"
+    tagged_topics: str = "[]"
     angle: str = ""
     style_variant: str = ""
     title_hash: str = ""
@@ -143,6 +144,7 @@ class ContentVariantGenerator:
                     title=title,
                     description=description,
                     keywords=candidate.get("keywords", "[]"),
+                    tagged_topics=candidate.get("tagged_topics", "[]"),
                     angle=candidate.get("angle", ""),
                     style_variant=candidate.get("style_variant", ""),
                     title_hash=title_hash,

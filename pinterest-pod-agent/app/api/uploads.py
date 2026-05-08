@@ -21,8 +21,12 @@ async def upload_image(file: UploadFile = File(...)) -> dict[str, str | int]:
             detail=f"Unsupported image extension: {suffix}",
         )
 
-    content = await file.read()
     max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    # Check Content-Length header first to reject large files before reading
+    content_length = file.headers.get("content-length")
+    if content_length and int(content_length) > max_bytes:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image too large")
+    content = await file.read(max_bytes + 1)
     if len(content) > max_bytes:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image too large")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -279,7 +280,7 @@ async def _regenerate_content(
         job.description_hash = dedup.stable_hash(description)
         job.content_hash = dedup.stable_hash(f"{title}|{description}")
         job.board_name = board
-        job.tagged_topics = __import__("json").dumps(topics, ensure_ascii=False)
+        job.tagged_topics = json.dumps(topics, ensure_ascii=False)
         job.variant_angle = content.get("angle") or job.variant_angle
         db.commit()
         logger.info(

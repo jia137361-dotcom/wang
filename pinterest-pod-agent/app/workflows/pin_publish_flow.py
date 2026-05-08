@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,26 +8,14 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
+
 from app.automation.browser_factory import BrowserSession, open_adspower_profile
-from app.automation.pinterest_flow import PinDraft, PinterestCredentials, PinterestFlow, PublishResult
+from app.automation.pinterest_flow import PinDraft, PublishResult
 from app.evomap.prompt_evolve import PromptContext, PromptEvolver
 from app.models.pin_performance import PinPerformance
 from app.models.social_account import SocialAccount
 from app.tools.adspower_api import AdsPowerClient
-
-
-@dataclass(frozen=True)
-class PublishWorkflowInput:
-    account_id: str
-    credentials: PinterestCredentials
-    board_name: str
-    image_path: Path
-    prompt_context: PromptContext
-    title: str
-    description: str
-    destination_url: str | None = None
-    campaign_id: str | None = None
-    visual_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,34 +29,6 @@ class AccountPublishWorkflowInput:
     destination_url: str | None = None
     campaign_id: str | None = None
     visual_prompt: str | None = None
-
-
-async def run_pin_publish_flow(
-    *,
-    db: Session,
-    pinterest: PinterestFlow,
-    workflow_input: PublishWorkflowInput,
-) -> PublishResult:
-    evolver = PromptEvolver(db=db)
-    content_prompt = evolver.build_content_prompt(workflow_input.prompt_context)
-
-    await pinterest.login(workflow_input.credentials)
-    result = await pinterest.publish_pin(_draft_from_input(workflow_input))
-    record = _record_publish(
-        db=db,
-        evolver=evolver,
-        workflow_input=workflow_input,
-        result=result,
-        content_prompt=content_prompt,
-    )
-    return PublishResult(
-        success=result.success,
-        pin_url=result.pin_url,
-        message=result.message,
-        debug_artifact_dir=result.debug_artifact_dir,
-        pin_performance_id=record.id,
-        publish_evidence=result.publish_evidence,
-    )
 
 
 async def run_pin_publish_with_adspower(
@@ -103,7 +64,7 @@ async def run_pin_publish_with_adspower(
         content_prompt = evolver.build_content_prompt(workflow_input.prompt_context)
         result = await pinterest.publish_pin(_draft_from_input(workflow_input))
         try:
-            record = _record_publish(
+            record = record_publish(
                 db=db,
                 evolver=evolver,
                 workflow_input=workflow_input,
@@ -142,7 +103,7 @@ def _draft_from_input(workflow_input: PublishWorkflowInput | AccountPublishWorkf
     )
 
 
-def _record_publish(
+def record_publish(
     *,
     db: Session,
     evolver: PromptEvolver,

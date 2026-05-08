@@ -186,8 +186,10 @@ class UIDecisionAgent:
         except Exception:
             pass
         in_dialog = await locator.evaluate("el => Boolean(el.closest('[role=\"dialog\"]'))")
-        selector = f"[data-ai-target='{index}']"
-        await locator.evaluate("(el, value) => el.setAttribute('data-ai-target', value)", str(index))
+        # Temporary attribute used to re-locate elements during execution.
+        # Prefixed with 'nanobot-' to avoid collision with site CSS/JS.
+        await locator.evaluate("(el, value) => el.setAttribute('data-nanobot-target', value)", str(index))
+        selector = f"[data-nanobot-target='{index}']"
         return UIControl(
             target_id=f"control_{index}",
             selector=selector,

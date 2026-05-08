@@ -87,20 +87,17 @@ class TestTitleIsDuplicate:
 
     def test_minor_rewrite_rejected(self, deduper: ContentDeduper) -> None:
         """A lightly rewritten title should still be flagged as duplicate."""
-        rejected = deduper.title_is_duplicate(
-            "Custom Pet Gift Ideas for Pet Lovers",
-            "Custom Pet Gift Ideas for Dog Lovers",
-        )
-        # similarity should be >= threshold
         sim = deduper.title_similarity(
             "Custom Pet Gift Ideas for Pet Lovers",
             "Custom Pet Gift Ideas for Dog Lovers",
         )
-        # If sim is above threshold, rejected must be True
-        if sim >= TITLE_SIMILARITY_THRESHOLD:
-            assert rejected is True
-        else:
-            assert rejected is False
+        # With one word changed, similarity must be above threshold
+        assert sim >= TITLE_SIMILARITY_THRESHOLD, f"Expected sim >= {TITLE_SIMILARITY_THRESHOLD}, got {sim}"
+        rejected = deduper.title_is_duplicate(
+            "Custom Pet Gift Ideas for Pet Lovers",
+            "Custom Pet Gift Ideas for Dog Lovers",
+        )
+        assert rejected is True
 
     def test_different_angle_title_passes(self, deduper: ContentDeduper) -> None:
         """Completely different niche angles should pass dedup."""
@@ -197,15 +194,10 @@ class TestBatchDedup:
             {"title": "Custom Pet Gift Ideas for Pet Lovers", "description": "desc A"},
             {"title": "Custom Pet Gift Ideas for Dog Lovers", "description": "desc B"},
         ]
-        kept = deduper.batch_dedup(candidates)
-        # if similarity >= threshold, second should be removed
         sim = deduper.title_similarity(
             "Custom Pet Gift Ideas for Pet Lovers",
             "Custom Pet Gift Ideas for Dog Lovers",
         )
-        expected = 1 if sim < TITLE_SIMILARITY_THRESHOLD else 1  # Actually first kept, second compared
-        # Actually it depends on whether the second is considered dup of first
-        if sim >= TITLE_SIMILARITY_THRESHOLD:
-            assert len(kept) == 1
-        else:
-            assert len(kept) == 2
+        kept = deduper.batch_dedup(candidates)
+        assert sim >= TITLE_SIMILARITY_THRESHOLD, f"Expected sim >= {TITLE_SIMILARITY_THRESHOLD}, got {sim}"
+        assert len(kept) == 1

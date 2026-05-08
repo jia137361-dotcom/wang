@@ -20,7 +20,7 @@ from app.models.social_account import SocialAccount
 from app.tools.adspower_api import AdsPowerClient
 from app.workflows.pin_publish_flow import (
     AccountPublishWorkflowInput,
-    _record_publish,
+    record_publish,
 )
 from app.workflows.warmup_flow import WarmupResult, run_warmup_session
 
@@ -72,7 +72,7 @@ async def run_warmup_then_publish(
             if policy and policy.warmup_duration_min:
                 warmup_duration_minutes = policy.warmup_duration_min
             else:
-                warmup_duration_minutes = 10
+                warmup_duration_minutes = 5
 
         # Truncate title and description to Pinterest limits before creating PinDraft
         truncated_title = job.title.strip()
@@ -155,7 +155,7 @@ async def run_warmup_then_publish(
 
                 evolver = PromptEvolver(db=db)
                 content_prompt = evolver.build_content_prompt(publish_input.prompt_context)
-                record = _record_publish(
+                record = record_publish(
                     db=db,
                     evolver=evolver,
                     workflow_input=publish_input,

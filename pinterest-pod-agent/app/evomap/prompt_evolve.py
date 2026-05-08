@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.evomap.strategy_matrix import get_strategy
+from app.models.content_template import ContentTemplate
 from app.models.pin_performance import PinPerformance
 from app.tools.volc_client import VolcClient
 
@@ -27,6 +30,18 @@ class PromptContext:
     season: str | None = None
     offer: str | None = None
     destination_url: str | None = None
+
+
+def prompt_context_from_request(payload: Any) -> PromptContext:
+    """Convert a request payload (PromptContextRequest or similar) to PromptContext."""
+    return PromptContext(
+        product_type=payload.product_type,
+        niche=payload.niche,
+        audience=payload.audience,
+        season=getattr(payload, "season", None),
+        offer=getattr(payload, "offer", None),
+        destination_url=getattr(payload, "destination_url", None),
+    )
 
 
 class PromptEvolver:
@@ -103,6 +118,8 @@ class PromptEvolver:
             product_type=context.product_type,
         )
         keyword_text = self._format_signals(signals)
+        trend_text = self._format_trends(self.get_trend_keywords(context))
+        template_text = self.get_template_text(context, "title_description")
         season_text = context.season or "no seasonal theme"
         offer_text = context.offer or "no discount specified"
         destination_text = context.destination_url or "to be filled before publish"
@@ -121,6 +138,12 @@ Destination URL: {destination_text}
 EvoMap high-CTR keyword signals (weighted by click feedback):
 {keyword_text}
 
+Manually approved trend keywords (must use 1-3 when available):
+{trend_text}
+
+Operator template for this niche/product:
+{template_text or "- No custom template configured. Use the default requirements below."}
+
 Requirements:
 1. Output valid JSON only. No markdown fences, no extra commentary.
 2. The JSON object must contain a "candidates" array with exactly 8 entries.
@@ -129,6 +152,7 @@ Requirements:
    - "description": SEO description, 350-500 chars, naturally weaving in 2-3
      high-weight keywords.
    - "keywords": array of 5-10 string keywords/tags.
+   - "tagged_topics": array of 3-5 Pinterest topic/tag strings.
    - "angle": one of "gift_idea", "room_decor", "personalized_keepsake",
      "seasonal_trend", "buyer_pain_point", "aesthetic_lifestyle",
      "budget_friendly", "problem_solver".
@@ -147,6 +171,8 @@ Requirements:
    - At least one candidate should use a seasonal or occasion-driven hook.
 
 5. All titles and descriptions must be in English.
+6. If trend keywords are available, every candidate must naturally include
+   1-3 of them across title, description, keywords, or tagged_topics.
 """.strip()
 
     def build_visual_prompt(self, context: PromptContext) -> str:
@@ -155,6 +181,8 @@ Requirements:
             product_type=context.product_type,
         )
         keyword_text = self._format_signals(signals)
+        trend_text = self._format_trends(self.get_trend_keywords(context))
+        template_text = self.get_template_text(context, "image_prompt")
 
         return f"""
 You are generating image-generation prompts for a POD (print-on-demand) product.
@@ -166,12 +194,20 @@ Target audience: {context.audience}
 EvoMap keyword signals:
 {keyword_text}
 
+Manually approved trend keywords (must influence the visual direction):
+{trend_text}
+
+Operator image prompt template:
+{template_text or "- No custom template configured. Use the default requirements below."}
+
 Output:
 1. 3 English image-generation prompts suitable for Pinterest vertical format.
 2. For each prompt, describe composition, main subject, colour palette,
    typography style, and the best POD product carrier (poster, mug, t-shirt, etc.).
 3. Avoid trademarked characters, celebrity likeness, copyrighted mascots,
    and misleading claims.
+4. If trend keywords are available, each prompt must use at least one as a
+   visual subject, phrase, mood, or audience angle.
 """.strip()
 
     # -- single-candidate content prompt (1 instead of 8) --------------------
@@ -182,6 +218,8 @@ Output:
             product_type=context.product_type,
         )
         keyword_text = self._format_signals(signals)
+        trend_text = self._format_trends(self.get_trend_keywords(context))
+        template_text = self.get_template_text(context, "title_description")
         season_text = context.season or "no seasonal theme"
         offer_text = context.offer or "no discount specified"
 
@@ -198,19 +236,32 @@ Offer / promo: {offer_text}
 EvoMap high-CTR keyword signals (weighted by click feedback):
 {keyword_text}
 
+Manually approved trend keywords (must use 1-3 when available):
+{trend_text}
+
+Operator template for this niche/product:
+{template_text or "- No custom template configured. Use the default requirements below."}
+
 Output exactly ONE JSON object (no array, no markdown fences):
 {{
   "title": "Pinterest title, max 95 chars, attention-grabbing, English",
   "description": "SEO description, 350-500 chars, naturally weaving 2-3 high-weight keywords, English",
-  "board": "A short Pinterest board name (1-4 words) matching the niche, English"
+  "board": "A short Pinterest board name (1-4 words) matching the niche, English",
+  "keywords": ["5-10 English SEO keywords"],
+  "tagged_topics": ["3-5 Pinterest topic/tag strings"],
+  "angle": "short content angle label"
 }}
+
+Rules:
+1. If trend keywords are available, title/description/keywords/tagged_topics
+   together must include 1-3 of them.
+2. Do not mention trend keywords unnaturally; adapt grammar when needed.
 """.strip()
 
     async def agenerate_single_content(
         self, context: PromptContext
     ) -> dict[str, str]:
         """Generate exactly ONE title+description pair via LLM."""
-        import json as _json
 
         prompt = self.build_simple_content_prompt(context)
         raw = await self.volc_client.agenerate_text(
@@ -229,13 +280,16 @@ Output exactly ONE JSON object (no array, no markdown fences):
                 lines = lines[:-1]
             raw = "\n".join(lines)
         try:
-            data = _json.loads(raw)
-        except _json.JSONDecodeError:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
             return {}
         return {
             "title": str(data.get("title", "")),
             "description": str(data.get("description", "")),
             "board": str(data.get("board", "")).strip() or None,
+            "keywords": data.get("keywords", []),
+            "tagged_topics": data.get("tagged_topics", []),
+            "angle": str(data.get("angle", "")).strip(),
         }
 
     # -- single visual prompt (1 instead of 3) --------------------------------
@@ -246,6 +300,8 @@ Output exactly ONE JSON object (no array, no markdown fences):
             product_type=context.product_type,
         )
         keyword_text = self._format_signals(signals)
+        trend_text = self._format_trends(self.get_trend_keywords(context))
+        template_text = self.get_template_text(context, "image_prompt")
 
         return f"""
 You are generating ONE image-generation prompt for a POD product.
@@ -257,6 +313,12 @@ Target audience: {context.audience}
 EvoMap keyword signals:
 {keyword_text}
 
+Manually approved trend keywords (must influence the prompt):
+{trend_text}
+
+Operator image prompt template:
+{template_text or "- No custom template configured. Use the default requirements below."}
+
 Output:
 1. Exactly ONE English image-generation prompt, 50-200 words.
 2. Describe composition, main subject, colour palette, lighting, typography
@@ -264,6 +326,8 @@ Output:
 3. Suited for Pinterest vertical format (2:3 aspect ratio).
 4. Avoid trademarked characters, celebrity likeness, copyrighted mascots.
 5. Output ONLY the raw prompt string. No markdown, no labels, no quotes.
+6. If trend keywords are available, use at least one as a visual subject,
+   phrase, mood, or audience angle.
 """.strip()
 
     async def agenerate_visual_brief(self, context: PromptContext) -> str:
@@ -285,15 +349,6 @@ Output:
     def generate_content_brief(self, context: PromptContext) -> str:
         prompt = self.build_content_prompt(context)
         return self.volc_client.generate_text(
-            prompt,
-            system_prompt="你是 Pinterest POD 增长专家，会把历史点击反馈转化为可执行文案策略。",
-            temperature=0.65,
-            max_tokens=1600,
-        )
-
-    async def agenerate_content_brief(self, context: PromptContext) -> str:
-        prompt = self.build_content_prompt(context)
-        return await self.volc_client.agenerate_text(
             prompt,
             system_prompt="你是 Pinterest POD 增长专家，会把历史点击反馈转化为可执行文案策略。",
             temperature=0.65,
@@ -336,7 +391,6 @@ Output:
         Returns a list of dicts with keys: title, description, keywords,
         angle, style_variant.  On parse failure returns an empty list.
         """
-        import json as _json
 
         prompt = self.build_content_prompt(context)
         raw = self.volc_client.generate_text(
@@ -350,26 +404,8 @@ Output:
         )
         return self._parse_candidates(raw)
 
-    async def agenerate_multi_candidates(
-        self, context: PromptContext
-    ) -> list[dict[str, str]]:
-        import json as _json
-
-        prompt = self.build_content_prompt(context)
-        raw = await self.volc_client.agenerate_text(
-            prompt,
-            system_prompt=(
-                "You are a rigorous Pinterest POD growth expert. "
-                "Always output valid JSON matching the requested schema exactly."
-            ),
-            temperature=0.75,
-            max_tokens=3200,
-        )
-        return self._parse_candidates(raw)
-
     @staticmethod
     def _parse_candidates(raw: str) -> list[dict[str, str]]:
-        import json as _json
 
         raw = raw.strip()
         # strip markdown fences if present
@@ -382,8 +418,8 @@ Output:
             raw = "\n".join(lines)
 
         try:
-            data = _json.loads(raw)
-        except _json.JSONDecodeError:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
             return []
 
         items = data.get("candidates") if isinstance(data, dict) else None
@@ -401,14 +437,67 @@ Output:
                 {
                     "title": str(item.get("title", "")),
                     "description": str(item.get("description", "")),
-                    "keywords": _json.dumps(
+                    "keywords": json.dumps(
                         item.get("keywords") if isinstance(item.get("keywords"), list) else []
+                    ),
+                    "tagged_topics": json.dumps(
+                        item.get("tagged_topics") if isinstance(item.get("tagged_topics"), list) else []
                     ),
                     "angle": str(item.get("angle", "")),
                     "style_variant": str(item.get("style_variant", "")),
                 }
             )
         return result
+
+    def get_trend_keywords(self, context: PromptContext, *, limit: int = 12) -> list[str]:
+        scopes = [
+            context.niche,
+            context.product_type,
+            f"{context.niche}:{context.product_type}",
+            "global",
+        ]
+        seen: list[str] = []
+        for scope in scopes:
+            if not scope:
+                continue
+            strategy = get_strategy(self.db, scope)
+            values = strategy.get("trend_keywords", [])
+            if isinstance(values, list):
+                for value in values:
+                    normalized = self._normalize_keyword(value)
+                    if normalized and normalized not in seen:
+                        seen.append(normalized)
+            for bucket in ("current_event_trends", "product_trends"):
+                bucket_values = strategy.get(bucket, [])
+                if not isinstance(bucket_values, list):
+                    continue
+                for item in bucket_values:
+                    if isinstance(item, dict):
+                        normalized = self._normalize_keyword(item.get("keyword"))
+                        if normalized and normalized not in seen:
+                            seen.append(normalized)
+        return seen[:limit]
+
+    def get_template_text(self, context: PromptContext, template_type: str) -> str:
+        scopes = [
+            f"{context.niche}:{context.product_type}",
+            context.niche,
+            context.product_type,
+            "global",
+        ]
+        for scope in scopes:
+            if not scope:
+                continue
+            template = self.db.scalar(
+                select(ContentTemplate).where(
+                    ContentTemplate.scope == scope,
+                    ContentTemplate.template_type == template_type,
+                    ContentTemplate.is_active == True,
+                )
+            )
+            if template and template.template_text.strip():
+                return template.template_text.strip()
+        return ""
 
     @staticmethod
     def _normalize_keyword(keyword: Any) -> str:
@@ -443,3 +532,9 @@ Output:
             f"- {signal.keyword}: weight={signal.weight}, avg_ctr={signal.avg_ctr}, samples={signal.sample_size}"
             for signal in signals
         )
+
+    @staticmethod
+    def _format_trends(keywords: list[str]) -> str:
+        if not keywords:
+            return "- No manually approved trend keywords for this scope."
+        return "\n".join(f"- {keyword}" for keyword in keywords)

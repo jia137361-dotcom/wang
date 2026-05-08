@@ -1,12 +1,58 @@
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.evomap.prompt_evolve import PromptContext, PromptEvolver
-from app.schemas.evomap import PromptBuildResponse, PromptContextRequest, StrategyAdviceResponse
+from app.evomap.prompt_evolve import PromptContext, PromptEvolver, prompt_context_from_request
+from app.models.content_template import ContentTemplate
+from app.schemas.evomap import (
+    ContentTemplateRead,
+    ContentTemplateUpsert,
+    PromptBuildResponse,
+    PromptContextRequest,
+    StrategyAdviceResponse,
+)
 
 
 router = APIRouter()
+
+
+@router.get("/templates", response_model=list[ContentTemplateRead])
+def list_templates(
+    scope: str | None = None,
+    template_type: str | None = Query(default=None, pattern="^(title_description|image_prompt)$"),
+    db: Session = Depends(get_db),
+) -> list[ContentTemplate]:
+    stmt = select(ContentTemplate).order_by(ContentTemplate.scope, ContentTemplate.template_type)
+    if scope:
+        stmt = stmt.where(ContentTemplate.scope == scope)
+    if template_type:
+        stmt = stmt.where(ContentTemplate.template_type == template_type)
+    return list(db.scalars(stmt).all())
+
+
+@router.put("/templates", response_model=ContentTemplateRead)
+def upsert_template(payload: ContentTemplateUpsert, db: Session = Depends(get_db)) -> ContentTemplate:
+    template = db.scalar(
+        select(ContentTemplate).where(
+            ContentTemplate.scope == payload.scope,
+            ContentTemplate.template_type == payload.template_type,
+        )
+    )
+    if template is None:
+        template = ContentTemplate(
+            scope=payload.scope,
+            template_type=payload.template_type,
+            template_text=payload.template_text,
+            is_active=payload.is_active,
+        )
+        db.add(template)
+    else:
+        template.template_text = payload.template_text
+        template.is_active = payload.is_active
+    db.commit()
+    db.refresh(template)
+    return template
 
 
 @router.get("/keyword-signals")
@@ -47,7 +93,7 @@ def strategy_advice(
 @router.post("/content-brief", response_model=PromptBuildResponse)
 def content_brief(payload: PromptContextRequest, db: Session = Depends(get_db)) -> PromptBuildResponse:
     evolver = PromptEvolver(db=db)
-    context = _to_prompt_context(payload)
+    context = prompt_context_from_request(payload)
     prompt = evolver.build_content_prompt(context)
     generated_text = evolver.generate_content_brief(context) if payload.generate else None
     return PromptBuildResponse(prompt=prompt, generated_text=generated_text)
@@ -56,7 +102,7 @@ def content_brief(payload: PromptContextRequest, db: Session = Depends(get_db)) 
 @router.post("/visual-prompt", response_model=PromptBuildResponse)
 def visual_prompt(payload: PromptContextRequest, db: Session = Depends(get_db)) -> PromptBuildResponse:
     evolver = PromptEvolver(db=db)
-    context = _to_prompt_context(payload)
+    context = prompt_context_from_request(payload)
     prompt = evolver.build_visual_prompt(context)
     generated_text = evolver.volc_client.generate_text(
         prompt,
@@ -67,12 +113,3 @@ def visual_prompt(payload: PromptContextRequest, db: Session = Depends(get_db)) 
     return PromptBuildResponse(prompt=prompt, generated_text=generated_text)
 
 
-def _to_prompt_context(payload: PromptContextRequest) -> PromptContext:
-    return PromptContext(
-        product_type=payload.product_type,
-        niche=payload.niche,
-        audience=payload.audience,
-        season=payload.season,
-        offer=payload.offer,
-        destination_url=payload.destination_url,
-    )

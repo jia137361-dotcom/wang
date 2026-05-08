@@ -80,6 +80,12 @@ def _validate_publish_payload(payload: PublishRequest, db: Session) -> None:
         campaign = db.scalar(select(Campaign).where(Campaign.campaign_id == payload.campaign_id))
         if campaign is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
+    if not payload.dry_run:
+        if not payload.image_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Image file not found: {payload.image_path}",
+            )
 
 
 def _prompt_context(payload: PublishRequest) -> PromptContext:

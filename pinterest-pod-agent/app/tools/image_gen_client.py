@@ -164,7 +164,11 @@ def _parse_image_size(image_size: str) -> str | dict[str, int]:
 def _build_fal_async_client(timeout_seconds: float) -> Any:
     if fal_client is None:
         raise RuntimeError("fal-client is not installed. Install it with: pip install fal-client")
-    return fal_client.AsyncClient(default_timeout=timeout_seconds)
+    from app.config import get_settings
+
+    settings = get_settings()
+    key = (settings.fal_key or "").strip()
+    return fal_client.AsyncClient(default_timeout=timeout_seconds, key=key if key else None)
 
 
 def _extract_flux_image_url(result: Mapping[str, Any]) -> str:

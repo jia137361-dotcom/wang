@@ -3,24 +3,17 @@ from __future__ import annotations
 import difflib
 import logging
 import json
-from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import Browser, BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from app.automation.ui_decision_agent import UIDecisionAgent, UIDecisionError
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class PinterestCredentials:
-    email: str
-    password: str
 
 
 @dataclass(frozen=True)
@@ -71,65 +64,6 @@ class PinterestFlow:
         self.page.set_default_timeout(default_timeout_ms)
         self.ui_decision_agent = UIDecisionAgent()
         self.ai_decision_log_path: Path | None = None
-
-    @classmethod
-    async def from_browser(cls, browser: Browser, *, storage_state_path: str | None = None) -> "PinterestFlow":
-        context_kwargs = {"storage_state": storage_state_path} if storage_state_path else {}
-        context = await browser.new_context(**context_kwargs)
-        page = await context.new_page()
-        return cls(page)
-
-    @property
-    def context(self) -> BrowserContext:
-        return self.page.context
-
-    async def login(self, credentials: PinterestCredentials) -> None:
-        try:
-            logger.info("Opening Pinterest login page")
-            await self.page.goto("https://www.pinterest.com/login/", wait_until="domcontentloaded")
-
-            if await self._is_logged_in():
-                logger.info("Pinterest session is already authenticated")
-                return
-
-            await self._fill_first_available(
-                [
-                    "input[type='email']",
-                    "input[name='id']",
-                    "input[name='email']",
-                    "input[autocomplete='username']",
-                ],
-                credentials.email,
-            )
-            await self._fill_first_available(
-                [
-                    "input[type='password']",
-                    "input[name='password']",
-                    "input[autocomplete='current-password']",
-                ],
-                credentials.password,
-            )
-            await self._click_first_available(
-                [
-                    "button[type='submit']",
-                    "button:has-text('Log in')",
-                    "button:has-text('Log In')",
-                ]
-            )
-
-            try:
-                await self.page.wait_for_url("**/homefeed/**", timeout=self.default_timeout_ms)
-            except PlaywrightTimeoutError:
-                if not await self._is_logged_in():
-                    raise
-
-            logger.info("Pinterest login completed")
-        except Exception as exc:
-            artifact_dir = await self.save_debug_artifacts("login_failed")
-            raise PinterestFlowError("Pinterest login failed", debug_artifact_dir=str(artifact_dir)) from exc
-
-    async def save_storage_state(self, path: str | Path) -> None:
-        await self.context.storage_state(path=str(path))
 
     async def create_board(self, board_name: str, *, secret: bool = False) -> None:
         try:
@@ -613,20 +547,6 @@ class PinterestFlow:
             logger.exception("Failed to save Pinterest debug HTML")
         return artifact_dir
 
-    async def close(self) -> None:
-        await self.context.close()
-
-    async def _is_logged_in(self) -> bool:
-        profile_selectors = [
-            "[data-test-id='header-profile']",
-            "a[href*='/settings/']",
-            "button[aria-label='Accounts and more options']",
-        ]
-        for selector in profile_selectors:
-            if await self.page.locator(selector).count():
-                return True
-        return False
-
     async def _set_file_input(self, image_path: Path) -> None:
         if "/pin/" in self.page.url and "pin-creation-tool" not in self.page.url and "pin-builder" not in self.page.url:
             raise RuntimeError("Refusing to upload while on a Pin detail page")
@@ -741,16 +661,6 @@ class PinterestFlow:
             "textarea[placeholder*='detailed description' i]",
         ]
         await self._fill_and_confirm(selectors, description, field_name="description")
-
-    async def _fill_destination_url(self, destination_url: str) -> None:
-        selectors = [
-            "input[placeholder='Add a link']",
-            "input[placeholder*='Add a link' i]",
-            "input[placeholder*='link' i]",
-            "input[aria-label*='link' i]",
-            "input[name='link']",
-        ]
-        await self._fill_first_available(selectors, destination_url)
 
     async def _ensure_on_creator(self, context: str = "") -> None:
         """Verify we are still on the pin creator; if not, navigate back to it."""
@@ -876,17 +786,6 @@ class PinterestFlow:
                     "Could not fill tagged topic=%s — input and chip selectors both failed, continuing",
                     topic,
                 )
-
-    async def _clear_first_available(self, selectors: list[str]) -> None:
-        """Clear the first matching input field."""
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector).first
-                if await locator.count() > 0:
-                    await locator.clear()
-                    return
-            except Exception:
-                continue
 
     async def _select_board(self, board_name: str, *, create_if_missing: bool) -> None:
         board_trigger_selectors = [

@@ -91,9 +91,8 @@ def create_publish_task(
         )
         if job is None:
             return {"error": f"Publish job not found: {job_id}"}
-        # Image will be auto-generated during publish if missing
-        if job.status == "cancelled":
-            return {"error": f"Publish job is cancelled: {job_id}"}
+        if job.status in ("cancelled", "published", "failed"):
+            return {"error": f"Publish job already finalized: {job_id} (status={job.status})"}
 
         now = _now()
         task = ScheduledTask(
@@ -326,6 +325,95 @@ def store_trend_signals(
 
 
 # ---------------------------------------------------------------------------
+# 5a. content templates
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def upsert_content_template(
+    scope: str,
+    template_type: str,
+    template_text: str,
+    is_active: bool = True,
+) -> dict[str, Any]:
+    """Create or update an EvoMap content template.
+
+    template_type must be "title_description" or "image_prompt".
+    scope can be a niche, product_type, "niche:product_type", or "global".
+    """
+    if template_type not in {"title_description", "image_prompt"}:
+        return {"error": "template_type must be title_description or image_prompt"}
+
+    from sqlalchemy import select
+
+    from app.models.content_template import ContentTemplate
+
+    db = _db()
+    try:
+        template = db.scalar(
+            select(ContentTemplate).where(
+                ContentTemplate.scope == scope,
+                ContentTemplate.template_type == template_type,
+            )
+        )
+        if template is None:
+            template = ContentTemplate(
+                scope=scope,
+                template_type=template_type,
+                template_text=template_text,
+                is_active=is_active,
+            )
+            db.add(template)
+        else:
+            template.template_text = template_text
+            template.is_active = is_active
+        db.commit()
+        db.refresh(template)
+        return {
+            "id": template.id,
+            "scope": template.scope,
+            "template_type": template.template_type,
+            "is_active": template.is_active,
+        }
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def list_content_templates(
+    scope: str | None = None,
+    template_type: str | None = None,
+) -> dict[str, Any]:
+    """List EvoMap content templates."""
+    from sqlalchemy import select
+
+    from app.models.content_template import ContentTemplate
+
+    db = _db()
+    try:
+        stmt = select(ContentTemplate).order_by(ContentTemplate.scope, ContentTemplate.template_type)
+        if scope:
+            stmt = stmt.where(ContentTemplate.scope == scope)
+        if template_type:
+            stmt = stmt.where(ContentTemplate.template_type == template_type)
+        rows = list(db.scalars(stmt).all())
+        return {
+            "templates": [
+                {
+                    "id": row.id,
+                    "scope": row.scope,
+                    "template_type": row.template_type,
+                    "template_text": row.template_text,
+                    "is_active": row.is_active,
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # 6. publish_pin_direct (forced dry_run=True)
 # ---------------------------------------------------------------------------
 
@@ -334,11 +422,11 @@ def store_trend_signals(
 def publish_pin_direct(
     account_id: str,
     job_id: str,
+    dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Publish a Pin immediately via warmup_and_publish (dry-run only for safety).
+    """Publish a Pin immediately via warmup_and_publish.
 
-    This tool always runs in dry_run mode — no real Pinterest publishing.
-    Use create_publish_task + dispatch_ready_tasks for production.
+    Defaults to dry_run=True for safety. Set dry_run=False for production.
     """
     from app.models.publish_job import PublishJob
     from app.models.social_account import SocialAccount
@@ -360,9 +448,8 @@ def publish_pin_direct(
         )
         if job is None:
             return {"error": f"Publish job not found: {job_id}"}
-        # Image will be auto-generated during publish if missing
-        if job.status == "cancelled":
-            return {"error": f"Publish job is cancelled: {job_id}"}
+        if job.status in ("cancelled", "published", "failed"):
+            return {"error": f"Publish job already finalized: {job_id} (status={job.status})"}
     finally:
         db.close()
 
@@ -372,13 +459,13 @@ def publish_pin_direct(
         account_id=account_id,
         job_id=job_id,
         warmup_duration_minutes=0,
-        dry_run=True,
+        dry_run=dry_run,
     )
     return {
         "celery_task_id": result.id,
         "job_id": job_id,
         "account_id": account_id,
-        "dry_run": True,
+        "dry_run": dry_run,
         "note": "Check task status with get_task_status",
     }
 

@@ -47,6 +47,7 @@ def generate_deduped_content(
         title=result.title,
         description=result.description,
         keywords=result.keywords,
+        tagged_topics=getattr(result, "tagged_topics", "[]"),
         angle=result.angle,
         style_variant=result.style_variant,
         title_hash=result.title_hash,
@@ -100,8 +101,9 @@ def get_publish_job(job_id: str, db: Session = Depends(get_db)) -> PublishJob:
     return job
 
 
-@router.post("/{job_id}/run", response_model=PublishRequest)
-def prepare_publish_job_run(job_id: str, db: Session = Depends(get_db)) -> PublishRequest:
+@router.post("/{job_id}/mark-ready", response_model=PublishJobRead)
+def mark_publish_job_ready(job_id: str, db: Session = Depends(get_db)) -> PublishJobRead:
+    """Mark a publish job as ready for dispatch (does NOT execute)."""
     job = _get_job(db, job_id)
     if job.status == "cancelled":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job is cancelled")
@@ -109,21 +111,8 @@ def prepare_publish_job_run(job_id: str, db: Session = Depends(get_db)) -> Publi
     job.status = "ready"
     job.started_at = datetime.now(UTC)
     db.commit()
-    return PublishRequest(
-        account_id=job.account_id,
-        campaign_id=job.campaign_id,
-        board_name=job.board_name,
-        image_path=Path(job.image_path),
-        title=job.title,
-        description=job.description,
-        destination_url=job.destination_url,
-        product_type=job.product_type,
-        niche=job.niche,
-        audience=job.audience,
-        season=job.season,
-        offer=job.offer,
-        dry_run=True,
-    )
+    db.refresh(job)
+    return job
 
 
 @router.post("/{job_id}/cancel", response_model=PublishJobRead)

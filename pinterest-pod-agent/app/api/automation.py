@@ -131,7 +131,7 @@ def enqueue_auto_reply(payload: AutoReplyTaskRequest) -> TaskEnqueueResponse:
 def _enqueue(task: Any, *args: Any, **kwargs: Any) -> TaskEnqueueResponse:
     try:
         async_result = task.delay(*args, **kwargs)
-    except RuntimeError as exc:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
