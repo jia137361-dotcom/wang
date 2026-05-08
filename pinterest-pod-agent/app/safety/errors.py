@@ -41,6 +41,11 @@ _FATAL_KEYWORDS = frozenset(
         "board not found", "board_name", "no such board",
         "nsfw", "safety check", "file not found", "no such file",
         "image path does not exist", "asset missing",
+        # Selector-not-found errors — retrying won't make selectors appear
+        "title_input_not_enabled",
+        "no title selector became visible",
+        "could not fill field with selectors",
+        "refusing to fill empty",
     }
 )
 

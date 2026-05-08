@@ -89,7 +89,7 @@ def dispatch_ready_tasks(
     for task in rows:
         if task.account_id:
             policy = _get_policy(db, task.account_id)
-            if not _can_run_now(task, policy, now):
+            if not _can_run_now(task, policy, now, db):
                 skipped["cooldown"] += 1
                 continue
             if not _within_time_window(policy, now):
@@ -185,10 +185,10 @@ def _get_policy(db: Session, account_id: str) -> AccountPolicy | None:
     )
 
 
-def _can_run_now(task: ScheduledTask, policy: AccountPolicy | None, now: datetime) -> bool:
+def _can_run_now(task: ScheduledTask, policy: AccountPolicy | None, now: datetime, db: Session) -> bool:
     if policy is None:
         return True
-    if policy.cooldown_until and now < policy.cooldown_until.replace(tzinfo=UTC):
+    if policy.cooldown_until and now < policy.cooldown_until.astimezone(UTC):
         logger.debug(
             "Account %s in cooldown until %s", task.account_id, policy.cooldown_until
         )
@@ -196,7 +196,9 @@ def _can_run_now(task: ScheduledTask, policy: AccountPolicy | None, now: datetim
 
     # daily post limit check
     if task.task_type in ("publish", "warmup_and_publish"):
-        today_posts = _count_posts_today(task.account_id)  # type: ignore[arg-type]
+        if task.account_id is None:
+            return False
+        today_posts = _count_posts_today(db, task.account_id, now)
         if today_posts >= policy.daily_max_posts:
             logger.debug(
                 "Account %s reached daily max posts (%d/%d)",
@@ -208,7 +210,7 @@ def _can_run_now(task: ScheduledTask, policy: AccountPolicy | None, now: datetim
 
         # min post interval check
         if policy.min_post_interval_min > 0:
-            last = _last_publish_time(task.account_id)  # type: ignore[arg-type]
+            last = _last_publish_time(db, task.account_id)
             if last is not None:
                 elapsed = (now - last).total_seconds()
                 if elapsed < policy.min_post_interval_min * 60:
@@ -240,36 +242,30 @@ def _within_time_window(policy: AccountPolicy | None, now: datetime) -> bool:
         return current_time >= start or current_time <= end
 
 
-def _count_posts_today(account_id: str) -> int:
+def _count_posts_today(db: Session, account_id: str, now: datetime) -> int:
     """Count posts published by this account today from scheduled_task."""
-    from app.database import get_sessionmaker
-
-    with get_sessionmaker()() as db:
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        return db.scalar(
-            select(func.count(ScheduledTask.id)).where(
-                ScheduledTask.account_id == account_id,
-                ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
-                ScheduledTask.status.in_(["completed", "published"]),
-                ScheduledTask.finished_at >= today,
-            )
-        ) or 0
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.scalar(
+        select(func.count(ScheduledTask.id)).where(
+            ScheduledTask.account_id == account_id,
+            ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
+            ScheduledTask.status.in_(["completed", "published"]),
+            ScheduledTask.finished_at >= today,
+        )
+    ) or 0
 
 
-def _last_publish_time(account_id: str) -> datetime | None:
+def _last_publish_time(db: Session, account_id: str) -> datetime | None:
     """Return the most recent publish finish time for *account_id* from
     scheduled_task.  Returns None if the account has never published."""
-    from app.database import get_sessionmaker
-
-    with get_sessionmaker()() as db:
-        return db.scalar(
-            select(ScheduledTask.finished_at)
-            .where(
-                ScheduledTask.account_id == account_id,
-                ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
-                ScheduledTask.status.in_(["completed", "published"]),
-                ScheduledTask.finished_at != None,  # noqa: E711
-            )
-            .order_by(ScheduledTask.finished_at.desc())
-            .limit(1)
+    return db.scalar(
+        select(ScheduledTask.finished_at)
+        .where(
+            ScheduledTask.account_id == account_id,
+            ScheduledTask.task_type.in_(["publish", "warmup_and_publish"]),
+            ScheduledTask.status.in_(["completed", "published"]),
+            ScheduledTask.finished_at != None,  # noqa: E711
         )
+        .order_by(ScheduledTask.finished_at.desc())
+        .limit(1)
+    )

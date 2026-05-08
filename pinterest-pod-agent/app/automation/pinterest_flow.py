@@ -237,7 +237,7 @@ class PinterestFlow:
         for url in creator_urls:
             for attempt in range(3):
                 await self.page.goto(url, wait_until="domcontentloaded")
-                if not await self._has_file_input(timeout_ms=15_000):
+                if not await self._has_file_input(timeout_ms=15_000) and not await self._has_upload_zone(timeout_ms=5_000):
                     continue  # try next URL
                 # Allow extra time for Pinterest SSR to deliver the React shell.
                 # Slow proxy or backend latency can cause the UserResource to
@@ -251,6 +251,11 @@ class PinterestFlow:
                     await self._wait_for_creator_form()
                     # Let Pinterest React hydrate so the file input's change handler is wired up.
                     await self.page.wait_for_timeout(3000)
+                    if not await self._ensure_upload_area_ready():
+                        if attempt < 2:
+                            logger.warning("Upload area not ready on %s (attempt %d), reloading...", url, attempt + 1)
+                            continue
+                        raise RuntimeError("Pinterest upload area did not appear")
                     return
                 except RuntimeError:
                     if attempt < 2:
@@ -264,7 +269,7 @@ class PinterestFlow:
         await self.page.goto("https://www.pinterest.com/", wait_until="domcontentloaded")
         try:
             await self._open_pin_creator_from_create_menu()
-            if await self._has_file_input(timeout_ms=20_000):
+            if await self._has_file_input(timeout_ms=20_000) or await self._ensure_upload_area_ready():
                 await self._wait_for_creator_form()
                 await self.page.wait_for_timeout(3000)
                 return
@@ -322,6 +327,38 @@ class PinterestFlow:
                 last_error = exc
         raise RuntimeError("Pinterest creator form did not become visible") from last_error
 
+    async def _ensure_upload_area_ready(self) -> bool:
+        """Verify the upload zone is present (not just the title input).
+
+        Pinterest sometimes delivers a half-rendered page where "Create Pin"
+        and the title input are visible but the upload area ("Choose a file
+        or drag and drop it here") is missing because of an SSR timeout.
+        """
+        upload_markers = [
+            "text=Choose a file",
+            "text=drag and drop",
+            "text=Save from URL",
+            "input[type='file']",
+        ]
+        for _ in range(20):
+            for marker in upload_markers:
+                try:
+                    loc = self.page.locator(marker).first
+                    if await loc.count() > 0:
+                        return True
+                except Exception:
+                    continue
+            # If only the create button is visible, click it to force a re-render
+            try:
+                create_btn = self.page.locator("[data-test-id='storyboard-create-button']").first
+                if await create_btn.count() > 0 and await create_btn.is_visible():
+                    await create_btn.click()
+                    await self.page.wait_for_timeout(2000)
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(500)
+        return False
+
     async def _dismiss_error_dialogs(self) -> None:
         """Close Pinterest error / alert dialogs that may block form interaction.
 
@@ -355,6 +392,7 @@ class PinterestFlow:
                 # Verify the title input is actually enabled before returning
                 if await self._is_title_input_enabled():
                     return
+                # Title input may not be ready yet, but preview is up — keep waiting
             try:
                 placeholder = self.page.locator("text=Choose a file or drag and drop it here").first
                 if await placeholder.count() == 0 or not await placeholder.is_visible():
@@ -364,14 +402,30 @@ class PinterestFlow:
             except Exception:
                 pass
             await self.page.wait_for_timeout(500)
+        # Final check: preview may be visible even if title input isn't ready yet
+        if await self._has_uploaded_preview():
+            return
         raise RuntimeError("upload_preview_timeout: upload preview not detected within 25s deadline")
 
     async def _is_title_input_enabled(self) -> bool:
-        """Check that the storyboard title input is not disabled."""
+        """Check that any title input is visible (Pinterest post-upload readiness signal)."""
+        _TITLE_SELECTORS = [
+            "input[placeholder='Add a title']",
+            "input[placeholder*='Add a title' i]",
+            "[aria-label='Title'] input",
+            "[data-test-id='pin-draft-title'] textarea",
+            "[data-test-id='pin-draft-title'] [contenteditable='true']",
+            "[contenteditable='true'][aria-label*='title' i]",
+            "div[role='textbox'][aria-label*='title' i]",
+        ]
         try:
-            title_input = self.page.locator("#storyboard-selector-title")
-            if await title_input.count() > 0:
-                return await title_input.is_enabled()
+            for sel in _TITLE_SELECTORS:
+                loc = self.page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        return True
+                except Exception:
+                    continue
             return False
         except Exception:
             return False
@@ -394,8 +448,9 @@ class PinterestFlow:
             return bool(
                 await self.page.evaluate(
                     """() => {
+                        // Standard <img> previews (old Pinterest UI)
                         const images = Array.from(document.querySelectorAll('img'));
-                        return images.some((img) => {
+                        const imgMatch = images.some((img) => {
                             if (!img.complete || img.naturalWidth <= 20 || img.naturalHeight <= 20) return false;
                             if (img.closest('aside, nav, [role="navigation"], [data-test-id="storyboard-drafts-sidebar"], [data-test-id="drafts-container"]')) return false;
                             const alt = (img.getAttribute('alt') || '').toLowerCase();
@@ -403,6 +458,26 @@ class PinterestFlow:
                             const rect = img.getBoundingClientRect();
                             return rect.width > 80 && rect.height > 80;
                         });
+                        if (imgMatch) return true;
+
+                        // New Pinterest UI: uploaded image rendered as <div> with
+                        // background-image blob URL + aria-label.
+                        const ariaPreview = document.querySelector(
+                            '[aria-label="Image uploaded for Pin creation"], [aria-label*="Image uploaded" i]'
+                        );
+                        if (ariaPreview) {
+                            const rect = ariaPreview.getBoundingClientRect();
+                            if (rect.width > 80 && rect.height > 80) return true;
+                        }
+
+                        // Also check for storyboard-thumbnail (Pinterest's preview wrapper)
+                        const thumbnail = document.querySelector('[data-test-id="storyboard-thumbnail"]');
+                        if (thumbnail) {
+                            const rect = thumbnail.getBoundingClientRect();
+                            if (rect.width > 80 && rect.height > 80) return true;
+                        }
+
+                        return false;
                     }"""
                 )
             )
@@ -530,42 +605,61 @@ class PinterestFlow:
     async def _set_file_input(self, image_path: Path) -> None:
         if "/pin/" in self.page.url and "pin-creation-tool" not in self.page.url and "pin-builder" not in self.page.url:
             raise RuntimeError("Refusing to upload while on a Pin detail page")
+
+        # Pinterest renders a visually-hidden <input type=file> (opacity:0,
+        # position:absolute) over a styled "Choose a file" drop zone.  The
+        # hidden input sits on top, so clicking the visible zone triggers the
+        # native file chooser.  We click the visible zone and capture the
+        # resulting file chooser — this is the most reliable method across
+        # Pinterest UI iterations.
+        upload_zone_selectors = [
+            "text=Choose a file",
+            "text=drag and drop",
+            "[data-test-id='storyboard-upload-input']",
+            "input[type='file']",
+            "[data-test-id='storyboard-create-button']",
+        ]
+        last_error: Exception | None = None
+        for sel in upload_zone_selectors:
+            try:
+                zone = self.page.locator(sel).first
+                await zone.wait_for(state="attached", timeout=10_000)
+                if await zone.count() == 0:
+                    continue
+                async with self.page.expect_file_chooser(timeout=10_000) as fc_info:
+                    try:
+                        await zone.click(force=True, timeout=3_000)
+                    except PlaywrightTimeoutError:
+                        # click may fail on invisible file input; that's fine —
+                        # the visible zone click below handles it
+                        pass
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(str(image_path))
+                logger.info("File attached via %s", sel)
+                return
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        # Last resort: try set_input_files on any hidden file input
         file_input = self.page.locator("input[type='file']").first
-        await file_input.wait_for(state="attached", timeout=15_000)
-        # Attach the file; if the React handler is not wired yet, also dispatch change.
-        await file_input.set_input_files(str(image_path))
-        await file_input.dispatch_event("change")
-        # Verify a file was actually attached.
         try:
-            file_count = await file_input.evaluate("el => el.files?.length || 0")
+            if await file_input.count() > 0:
+                await file_input.set_input_files(str(image_path))
+                await file_input.dispatch_event("change")
+                file_count = await file_input.evaluate("el => el.files?.length || 0")
+                if file_count > 0:
+                    logger.info("File attached via set_input_files fallback")
+                    return
         except Exception:
-            file_count = 0
-        logger.info("Pinterest file input set, files attached=%d", file_count)
-        if file_count == 0:
-            # Fallback: trigger a file chooser via click so Playwright can inject the file.
-            logger.warning("set_input_files did not attach a file; trying file chooser fallback")
-            async with self.page.expect_file_chooser(timeout=8_000) as fc_info:
-                await file_input.click(force=True)
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(str(image_path))
+            pass
+
+        raise RuntimeError("upload_failed: could not upload file") from last_error
 
     async def _fill_title(self, title: str) -> None:
         if len(title) > 100:
             logger.warning("Title truncated from %d to 100 chars", len(title))
             title = title[:100].strip()
-        # Wait for the title input to become enabled (Pinterest enables it after upload)
-        title_enabled = False
-        for _ in range(60):
-            try:
-                title_input = self.page.locator("#storyboard-selector-title")
-                if await title_input.count() > 0 and await title_input.is_enabled():
-                    title_enabled = True
-                    break
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(500)
-        if not title_enabled:
-            raise RuntimeError("title_input_not_enabled: #storyboard-selector-title did not become enabled within 30s")
         selectors = [
             "input[placeholder='Add a title']",
             "input[placeholder*='Add a title' i]",
@@ -577,6 +671,22 @@ class PinterestFlow:
             "[contenteditable='true'][aria-label*='title' i]",
             "div[role='textbox'][aria-label*='title' i]",
         ]
+        # Wait for any title input to become visible (Pinterest enables it after upload)
+        title_ready = False
+        for _ in range(60):
+            for sel in selectors:
+                try:
+                    loc = self.page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        title_ready = True
+                        break
+                except Exception:
+                    continue
+            if title_ready:
+                break
+            await self.page.wait_for_timeout(500)
+        if not title_ready:
+            raise RuntimeError("title_input_not_enabled: no title selector became visible within 30s")
         await self._fill_and_confirm(selectors, title[:100], field_name="title")
 
     async def _fill_description(self, description: str) -> None:
@@ -1264,6 +1374,25 @@ class PinterestFlow:
     @staticmethod
     def _normalize_text(value: str) -> str:
         return " ".join(value.split()).strip()
+
+    async def _has_upload_zone(self, *, timeout_ms: int) -> bool:
+        """Check for upload-zone markers (text or button) even when no <input type=file> is rendered."""
+        upload_markers = [
+            "text=Choose a file",
+            "text=drag and drop",
+            "text=Save from URL",
+            "[data-test-id='storyboard-create-button']",
+        ]
+        deadline = datetime.now(UTC).timestamp() + (timeout_ms / 1000)
+        while datetime.now(UTC).timestamp() < deadline:
+            for marker in upload_markers:
+                try:
+                    if await self.page.locator(marker).first.count() > 0:
+                        return True
+                except Exception:
+                    continue
+            await self.page.wait_for_timeout(500)
+        return False
 
     async def _has_file_input(self, *, timeout_ms: int) -> bool:
         deadline = datetime.now(UTC).timestamp() + (timeout_ms / 1000)

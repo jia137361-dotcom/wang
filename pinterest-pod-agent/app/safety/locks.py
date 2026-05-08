@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOCK_TTL_SECONDS = 600  # 10 minutes — matches typical publish job
 LOCK_PREFIX = "nanobot:lock"
 
+_redis_async: aioredis.Redis | None = None
+_redis_async_loop_id: int | None = None
+_redis_sync: redis.Redis | None = None
+
 
 def _worker_id() -> str:
     host = os.environ.get("HOSTNAME", os.environ.get("COMPUTERNAME", "unknown"))
@@ -45,8 +49,39 @@ def _worker_id() -> str:
 
 
 async def _get_redis() -> aioredis.Redis:
-    settings = get_settings()
-    return aioredis.from_url(settings.redis_url, decode_responses=True)
+    global _redis_async, _redis_async_loop_id
+    try:
+        current_loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        current_loop_id = None
+
+    if _redis_async is not None and _redis_async_loop_id != current_loop_id:
+        try:
+            await _redis_async.aclose()
+        except Exception:
+            pass
+        _redis_async = None
+        _redis_async_loop_id = None
+
+    if _redis_async is None:
+        settings = get_settings()
+        _redis_async = aioredis.from_url(
+            settings.redis_url, decode_responses=True,
+            max_connections=20, health_check_interval=30,
+        )
+        _redis_async_loop_id = current_loop_id
+    return _redis_async
+
+
+def _get_redis_sync() -> redis.Redis:
+    global _redis_sync
+    if _redis_sync is None:
+        settings = get_settings()
+        _redis_sync = redis.from_url(
+            settings.redis_url, decode_responses=True,
+            max_connections=20, health_check_interval=30,
+        )
+    return _redis_sync
 
 
 # Lua script: delete *key* only if its value equals *owner*.
@@ -85,7 +120,6 @@ async def account_lock(
         if acquired:
             await redis.eval(_RELEASE_SCRIPT, 1, key, owner)
             logger.debug("account lock released account=%s owner=%s", account_id, owner)
-        await redis.aclose()
 
 
 @asynccontextmanager
@@ -114,7 +148,6 @@ async def profile_lock(
         if acquired:
             await redis.eval(_RELEASE_SCRIPT, 1, key, owner)
             logger.debug("profile lock released profile=%s owner=%s", profile_id, owner)
-        await redis.aclose()
 
 
 # Lua script: for each key, if value matches owner, renew TTL.
@@ -135,17 +168,14 @@ async def renew_locks_once(
     ttl: int = DEFAULT_LOCK_TTL_SECONDS,
 ) -> None:
     """Renew Redis lock TTLs once (non-looping variant of renew_locks)."""
-    redis = await _get_redis()
+    r = await _get_redis()
     owner = _worker_id()
-    try:
-        account_key = f"{LOCK_PREFIX}:account:{account_id}"
-        await redis.eval(_RENEW_SCRIPT, 1, account_key, owner, str(ttl))
-        if profile_id:
-            profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
-            await redis.eval(_RENEW_SCRIPT, 1, profile_key, owner, str(ttl))
-        logger.debug("locks renewed once account=%s profile=%s", account_id, profile_id)
-    finally:
-        await redis.aclose()
+    account_key = f"{LOCK_PREFIX}:account:{account_id}"
+    await r.eval(_RENEW_SCRIPT, 1, account_key, owner, str(ttl))
+    if profile_id:
+        profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
+        await r.eval(_RENEW_SCRIPT, 1, profile_key, owner, str(ttl))
+    logger.debug("locks renewed once account=%s profile=%s", account_id, profile_id)
 
 
 def renew_locks_once_sync(
@@ -156,20 +186,16 @@ def renew_locks_once_sync(
 ) -> None:
     """Synchronous variant of renew_locks_once — safe to call from any context
     including inside an already-running event loop (no nested loop)."""
-    settings = get_settings()
-    r = redis.from_url(settings.redis_url, decode_responses=True)
+    r = _get_redis_sync()
     owner = _worker_id()
-    try:
-        account_key = f"{LOCK_PREFIX}:account:{account_id}"
-        if r.get(account_key) == owner:
-            r.expire(account_key, ttl)
-        if profile_id:
-            profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
-            if r.get(profile_key) == owner:
-                r.expire(profile_key, ttl)
-        logger.debug("locks renewed sync account=%s profile=%s", account_id, profile_id)
-    finally:
-        r.close()
+    account_key = f"{LOCK_PREFIX}:account:{account_id}"
+    if r.get(account_key) == owner:
+        r.expire(account_key, ttl)
+    if profile_id:
+        profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
+        if r.get(profile_key) == owner:
+            r.expire(profile_key, ttl)
+    logger.debug("locks renewed sync account=%s profile=%s", account_id, profile_id)
 
 
 async def renew_locks(
@@ -186,18 +212,15 @@ async def renew_locks(
     """
     if stop_event is None:
         stop_event = asyncio.Event()
-    redis = await _get_redis()
+    r = await _get_redis()
     owner = _worker_id()
     account_key = f"{LOCK_PREFIX}:account:{account_id}"
     profile_key = f"{LOCK_PREFIX}:adspower:{profile_id}"
-    try:
-        while not stop_event.is_set():
-            await asyncio.sleep(interval)
-            if stop_event.is_set():
-                break
-            await redis.eval(
-                _RENEW_SCRIPT, 2, account_key, profile_key, owner, str(ttl)
-            )
-            logger.debug("locks renewed account=%s profile=%s", account_id, profile_id)
-    finally:
-        await redis.aclose()
+    while not stop_event.is_set():
+        await asyncio.sleep(interval)
+        if stop_event.is_set():
+            break
+        await r.eval(
+            _RENEW_SCRIPT, 2, account_key, profile_key, owner, str(ttl)
+        )
+        logger.debug("locks renewed account=%s profile=%s", account_id, profile_id)

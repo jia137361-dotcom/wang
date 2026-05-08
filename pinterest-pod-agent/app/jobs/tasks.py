@@ -618,6 +618,7 @@ def publish_job_task(
         job.content_batch_id = batch_id
         job.status = "running"
         job.started_at = datetime.now(UTC)
+        job.finished_at = None
         job.error_message = None
         db.commit()
 
@@ -1068,6 +1069,7 @@ def warmup_and_publish_task(
 
             job.status = "running"
             job.started_at = datetime.now(UTC)
+            job.finished_at = None
             job.error_message = None
             db.commit()
 
