@@ -490,17 +490,42 @@ class PinterestFlow:
         except PlaywrightTimeoutError:
             logger.info("Pinterest did not reach networkidle after Publish; continuing success probes")
         try:
-            await self.page.wait_for_url("**/pin/**", timeout=15_000)
+            await self.page.wait_for_url("**/pin/**", timeout=8_000)
         except PlaywrightTimeoutError:
             logger.info("Pin URL transition was not observed; trying result links")
+
+        # Poll for the success toast / banner (new Pinterest UI shows a
+        # bottom toast instead of navigating away).  Wait up to 20 s.
+        deadline = datetime.now(UTC).timestamp() + 20
+        while datetime.now(UTC).timestamp() < deadline:
+            pin_url = await self._extract_created_pin_url()
+            if pin_url:
+                return {
+                    "success_signal": True, "success_source": "pin_url",
+                    "pin_url": pin_url, "final_url": self.page.url,
+                }
+            success_signal = await self._detect_publish_success_signal()
+            if success_signal:
+                # Try to click "See it now" to extract the pin URL
+                pin_url = await self._click_see_it_now_and_extract_url()
+                return {
+                    "success_signal": True,
+                    "success_source": "success_text",
+                    "pin_url": pin_url,
+                    "final_url": self.page.url,
+                }
+            await self.page.wait_for_timeout(800)
+
+        # One last check
         pin_url = await self._extract_created_pin_url()
         success_signal = await self._detect_publish_success_signal()
-        final_url = self.page.url
+        if success_signal and not pin_url:
+            pin_url = await self._click_see_it_now_and_extract_url()
         return {
             "success_signal": bool(pin_url or success_signal),
-            "success_source": "pin_url" if pin_url else success_signal,
+            "success_source": "pin_url" if pin_url else ("success_text" if success_signal else None),
             "pin_url": pin_url,
-            "final_url": final_url,
+            "final_url": self.page.url,
         }
 
     async def _ai_handle_interruptions(self, *, stage: str, objective: str) -> None:
@@ -1126,33 +1151,74 @@ class PinterestFlow:
         raise RuntimeError("Could not click Pinterest publish button") from last_error
 
     async def _extract_created_pin_url(self) -> str | None:
-        view_pin = self.page.get_by_role("link", name="View Pin")
-        if await view_pin.count():
-            href = await view_pin.first.get_attribute("href")
-            if href:
-                return href if href.startswith("http") else f"https://www.pinterest.com{href}"
+        # "See it now" link in the success toast (new Pinterest UI)
+        for name in ["See it now", "View Pin", "See your Pin"]:
+            link = self.page.get_by_role("link", name=name)
+            if await link.count():
+                href = await link.first.get_attribute("href")
+                if href:
+                    return href if href.startswith("http") else f"https://www.pinterest.com{href}"
+        # Fallback: any link whose href looks like a pin URL
+        try:
+            pin_link = self.page.locator("a[href*='/pin/']").first
+            if await pin_link.count() > 0 and await pin_link.is_visible():
+                href = await pin_link.get_attribute("href")
+                if href:
+                    return href if href.startswith("http") else f"https://www.pinterest.com{href}"
+        except Exception:
+            pass
         if "/pin/" in self.page.url:
             return self.page.url
         return None
 
+    async def _click_see_it_now_and_extract_url(self) -> str | None:
+        """Click the 'See it now' link in the success toast and capture the pin URL."""
+        for name in ["See it now", "View Pin", "See your Pin"]:
+            try:
+                link = self.page.get_by_role("link", name=name)
+                if await link.count() and await link.is_visible():
+                    href = await link.first.get_attribute("href")
+                    if href:
+                        return href if href.startswith("http") else f"https://www.pinterest.com{href}"
+                    async with self.page.expect_navigation(wait_until="domcontentloaded", timeout=10_000):
+                        await link.first.click()
+                    await self.page.wait_for_timeout(1_000)
+                    if "/pin/" in self.page.url:
+                        return self.page.url
+            except Exception:
+                continue
+        return None
+
     async def _detect_publish_success_signal(self) -> str | None:
         success_selectors = [
+            # Exact text patterns for the new Pinterest success toast
             "text=/your pin was published/i",
+            "text=/your pin has been published/i",
             "text=/pin was published/i",
             "text=/pin published/i",
-            "text=/published/i",
-            "text=/changes published/i",
             "text=/see it now/i",
             "text=/view pin/i",
             "text=/pin created/i",
             "text=/your pin is live/i",
             "text=/successfully published/i",
+            "text=/changes published/i",
+            # General "published" text — checked last to avoid false positives
+            "text=/published/i",
+            # data-test-id and aria roles
             "[data-test-id='pin-publish-success']",
             "[data-test-id='publish-success-toast']",
+            "[data-test-id='publish-success-banner']",
             "[role='alert']:has-text('published')",
+            "[role='status']:has-text('published')",
+            # Bottom toast / snackbar patterns
+            "[aria-live='polite']:has-text('published')",
+            "[aria-live='assertive']:has-text('published')",
+            # Structural matches
             "h1:has-text('Published')",
-            "div:has-text('Your Pin was published')",
+            "h2:has-text('Published')",
             "div:has-text('See it now')",
+            "a:has-text('See it now')",
+            "a:has-text('View Pin')",
         ]
         for selector in success_selectors:
             try:
@@ -1163,6 +1229,11 @@ class PinterestFlow:
                     lowered = normalized.lower()
                     if "changes stored" in lowered or "draft" in lowered:
                         continue
+                    # For the broad "published" text match, require it to be in
+                    # a non-header context (to avoid matching nav items)
+                    if selector == "text=/published/i":
+                        if "pin" not in lowered and "your" not in lowered:
+                            continue
                     return normalized or selector
             except Exception:
                 continue
