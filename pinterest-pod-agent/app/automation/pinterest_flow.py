@@ -444,7 +444,7 @@ class PinterestFlow:
                 pin_url = await self._click_see_it_now_and_extract_url()
                 return {
                     "success_signal": True,
-                    "success_source": "success_text",
+                    "success_source": success_signal,
                     "pin_url": pin_url,
                     "final_url": self.page.url,
                 }
@@ -457,7 +457,7 @@ class PinterestFlow:
             pin_url = await self._click_see_it_now_and_extract_url()
         return {
             "success_signal": bool(pin_url or success_signal),
-            "success_source": "pin_url" if pin_url else ("success_text" if success_signal else None),
+            "success_source": "pin_url" if pin_url else success_signal,
             "pin_url": pin_url,
             "final_url": self.page.url,
         }

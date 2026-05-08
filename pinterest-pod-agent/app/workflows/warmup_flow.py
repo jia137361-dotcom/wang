@@ -452,25 +452,6 @@ async def _interact_with_random_pin(
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatibility stubs for safety-gate check scripts
-# ---------------------------------------------------------------------------
-
-
-def run_account_warmup_placeholder(account_id: str) -> None:
-    """Safety-gated no-op retained for check_sensitive_placeholders.py."""
-    logger.info("warmup placeholder for %s (no-op)", account_id)
-
-
-@dataclass(frozen=True)
-class _WarmupResultStub:
-    executed: bool = False
-
-
-class WarmupFlow:
-    """Backward-compatible safety-gated stub for check_sensitive_placeholders."""
-
-    def run(self, account_id: str) -> _WarmupResultStub:
-        return _WarmupResultStub(executed=False)
 
 
 def _is_pinterest_url(url: str) -> bool:
